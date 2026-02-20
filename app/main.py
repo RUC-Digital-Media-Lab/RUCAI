@@ -37,6 +37,7 @@ from .db import (
     get_bot_instance_for_owner,
     list_courses,
     list_bot_instances_for_owner,
+    list_bot_instance_documents,
     get_course_prompt,
     get_document,
     get_connection,
@@ -870,8 +871,11 @@ STUDENT_UI_HTML = """<!doctype html>
     <title>RUCAI Student</title>
     <style>
       body { margin: 0; font-family: "Avenir Next", "IBM Plex Sans", sans-serif; background: #f7f5f0; color: #1f1f1d; }
-      .wrap { width: min(900px, 94vw); margin: 24px auto; }
+      .wrap { width: min(1200px, 96vw); margin: 24px auto; }
       .card { background: #fff; border: 1px solid #ddd8cf; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+      .student-layout { display: grid; grid-template-columns: 280px 1fr; gap: 12px; align-items: start; }
+      .student-sidebar { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; }
+      @media (max-width: 960px) { .student-layout { grid-template-columns: 1fr; } .student-sidebar { position: static; max-height: none; } }
       .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
       input, textarea { width: 100%; border: 1px solid #cfc8bc; border-radius: 8px; padding: 10px; font: inherit; }
       textarea { min-height: 100px; resize: vertical; }
@@ -880,8 +884,14 @@ STUDENT_UI_HTML = """<!doctype html>
       .small { font-size: 13px; color: #555; margin-top: 8px; }
       .err { color: #b3261e; }
       .ok { color: #1f7a45; }
-      .answer { white-space: pre-wrap; margin-top: 10px; }
+      .answer { margin-top: 10px; line-height: 1.5; }
+      .answer p { margin: 0 0 10px; }
+      .answer ul { margin: 0 0 10px 22px; padding: 0; }
+      .answer li { margin-bottom: 6px; }
+      .answer strong { font-weight: 700; }
       .source { margin-top: 8px; border-top: 1px dashed #d8d3cb; padding-top: 8px; font-size: 13px; }
+      .doc-item { border: 1px solid #ddd8cf; border-radius: 8px; padding: 8px; margin-bottom: 8px; background: #fff; }
+      .doc-item .mono { color: #666; font-size: 12px; }
       .hidden { display: none !important; }
     </style>
   </head>
@@ -897,21 +907,30 @@ STUDENT_UI_HTML = """<!doctype html>
         <div id="loginState" class="small"></div>
       </section>
 
-      <section id="studentCard" class="card hidden">
-        <div class="row">
-          <h3 id="instanceTitle" style="margin:0;">Instance</h3>
-          <button id="studentLogoutBtn" class="warn">Log ud</button>
+      <section id="studentCard" class="hidden">
+        <div class="student-layout">
+          <aside class="card student-sidebar">
+            <h3 style="margin-top:0;">Materialer</h3>
+            <div class="small">Tekster i denne student-instance.</div>
+            <div id="studentDocs" style="margin-top:10px;"></div>
+          </aside>
+          <section class="card">
+            <div class="row">
+              <h3 id="instanceTitle" style="margin:0;">Instance</h3>
+              <button id="studentLogoutBtn" class="warn">Log ud</button>
+            </div>
+            <div class="row">
+              <textarea id="studentQuestion" placeholder="Stil et spørgsmål til materialet..."></textarea>
+            </div>
+            <div class="row">
+              <input id="studentTopK" type="number" min="1" max="50" value="5" />
+              <button id="studentAskBtn">Spørg</button>
+            </div>
+            <div id="studentState" class="small"></div>
+            <div id="studentAnswer" class="answer"></div>
+            <div id="studentSources"></div>
+          </section>
         </div>
-        <div class="row">
-          <textarea id="studentQuestion" placeholder="Stil et spørgsmål til materialet..."></textarea>
-        </div>
-        <div class="row">
-          <input id="studentTopK" type="number" min="1" max="50" value="5" />
-          <button id="studentAskBtn">Spørg</button>
-        </div>
-        <div id="studentState" class="small"></div>
-        <div id="studentAnswer" class="answer"></div>
-        <div id="studentSources"></div>
       </section>
     </div>
 
@@ -925,6 +944,7 @@ STUDENT_UI_HTML = """<!doctype html>
       const instanceTitle = document.getElementById("instanceTitle");
       const answerEl = document.getElementById("studentAnswer");
       const sourcesEl = document.getElementById("studentSources");
+      const studentDocsEl = document.getElementById("studentDocs");
       const pathMatch = window.location.pathname.match(/^\\/student\\/i\\/([^/]+)$/);
       const defaultInstanceCode = pathMatch ? decodeURIComponent(pathMatch[1] || "").toUpperCase() : "";
       if (!defaultInstanceCode) {
@@ -935,6 +955,33 @@ STUDENT_UI_HTML = """<!doctype html>
         const d = document.createElement("div");
         d.innerText = String(text ?? "");
         return d.innerHTML;
+      }
+
+      function markdownToHtml(md) {
+        const lines = String(md || "").split("\\n");
+        const out = [];
+        let inList = false;
+        const inline = (txt) => escapeHtml(txt)
+          .replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>")
+          .replace(/\\*(.+?)\\*/g, "<em>$1</em>")
+          .replace(/`([^`]+)`/g, "<code>$1</code>");
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line) {
+            if (inList) { out.push("</ul>"); inList = false; }
+            continue;
+          }
+          const bullet = line.match(/^[-*]\\s+(.+)$/);
+          if (bullet) {
+            if (!inList) { out.push("<ul>"); inList = true; }
+            out.push(`<li>${inline(bullet[1])}</li>`);
+            continue;
+          }
+          if (inList) { out.push("</ul>"); inList = false; }
+          out.push(`<p>${inline(line)}</p>`);
+        }
+        if (inList) out.push("</ul>");
+        return out.join("");
       }
 
       async function api(path, options = {}) {
@@ -954,6 +1001,7 @@ STUDENT_UI_HTML = """<!doctype html>
         try {
           const data = await api("/student/instance");
           instanceTitle.textContent = data.instance.name || "Instance";
+          await refreshStudentDocuments();
           loginCard.classList.add("hidden");
           studentCard.classList.remove("hidden");
         } catch (err) {
@@ -962,6 +1010,25 @@ STUDENT_UI_HTML = """<!doctype html>
           loginCard.classList.remove("hidden");
           studentCard.classList.add("hidden");
           loginState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        }
+      }
+
+      async function refreshStudentDocuments() {
+        try {
+          const data = await api("/student/documents");
+          const docs = data.documents || [];
+          if (!docs.length) {
+            studentDocsEl.innerHTML = '<div class="small">Ingen dokumenter fundet i denne instance.</div>';
+            return;
+          }
+          studentDocsEl.innerHTML = docs.map((d) => `
+            <div class="doc-item">
+              <div><strong>${escapeHtml(d.filename)}</strong></div>
+              <div class="mono">chunks: ${d.chunk_count}</div>
+            </div>
+          `).join("");
+        } catch (err) {
+          studentDocsEl.innerHTML = `<div class="small err">${escapeHtml(err.message)}</div>`;
         }
       }
 
@@ -1016,7 +1083,7 @@ STUDENT_UI_HTML = """<!doctype html>
             body: JSON.stringify({ message, k }),
           });
           studentState.innerHTML = `<span class="ok">Færdig</span>`;
-          answerEl.textContent = data.answer || "";
+          answerEl.innerHTML = markdownToHtml(data.answer || "");
           (data.contexts || []).forEach((ctx) => {
             const div = document.createElement("div");
             div.className = "source";
@@ -1226,8 +1293,20 @@ def student_instance(instance_id: int = Depends(require_student_auth)) -> dict[s
             "name": item["name"],
             "instance_code": item["instance_code"],
             "chunk_count": item["chunk_count"],
+            "source_course_id": item.get("source_course_id"),
         }
     }
+
+
+@app.get("/student/documents")
+def student_documents(instance_id: int = Depends(require_student_auth)) -> dict[str, object]:
+    settings = load_settings()
+    with get_connection(settings) as conn:
+        item = get_bot_instance_by_id(conn, instance_id)
+        if not item or not item.get("is_active"):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
+        docs = list_bot_instance_documents(conn, instance_id)
+    return {"instance_id": instance_id, "documents": docs}
 
 
 @app.post("/student/chat")

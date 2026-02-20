@@ -87,6 +87,11 @@ def test_student_login_and_chat_success(client: TestClient, monkeypatch):
     )
     monkeypatch.setattr(
         main,
+        "list_bot_instance_documents",
+        lambda _conn, _iid: [{"filename": "doc.pdf", "chunk_count": 4}],
+    )
+    monkeypatch.setattr(
+        main,
         "search_instance_chunks",
         lambda _q, _settings, _k, _iid: [
             {"filename": "doc.pdf", "page_start": 1, "chunk_index": 0, "content": "Test content"}
@@ -102,6 +107,10 @@ def test_student_login_and_chat_success(client: TestClient, monkeypatch):
     meta = client.get("/student/instance", headers=headers)
     assert meta.status_code == 200
     assert meta.json()["instance"]["name"] == "Hold A"
+
+    docs = client.get("/student/documents", headers=headers)
+    assert docs.status_code == 200
+    assert docs.json()["documents"][0]["filename"] == "doc.pdf"
 
     chat = client.post("/student/chat", headers=headers, json={"message": "hej", "k": 3})
     assert chat.status_code == 200

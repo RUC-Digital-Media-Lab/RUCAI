@@ -1074,3 +1074,21 @@ def get_bot_instance_by_id(conn: psycopg.Connection, instance_id: int) -> Option
         "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
         "chunk_count": row[12],
     }
+
+
+def list_bot_instance_documents(conn: psycopg.Connection, instance_id: int) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                filename,
+                COUNT(*) AS chunk_count
+            FROM bot_instance_chunks
+            WHERE instance_id = %s
+            GROUP BY filename
+            ORDER BY filename ASC;
+            """,
+            (instance_id,),
+        )
+        rows = cur.fetchall()
+    return [{"filename": row[0], "chunk_count": row[1]} for row in rows]
