@@ -355,7 +355,7 @@ WEB_UI_HTML = """<!doctype html>
       }
 
       function buildInviteText(instanceCode, passwordText) {
-        const studentUrl = `${window.location.origin}/student`;
+        const studentUrl = `${window.location.origin}/student/i/${instanceCode}`;
         const passwordLine = passwordText && passwordText.trim()
           ? passwordText.trim()
           : "[det password du valgte ved publish]";
@@ -889,9 +889,8 @@ STUDENT_UI_HTML = """<!doctype html>
     <div class="wrap">
       <section id="loginCard" class="card">
         <h2>RUCAI Student</h2>
-        <div class="small">Log ind med instance code og password fra underviser.</div>
+        <div id="studentLoginHint" class="small">Log ind med password fra underviserens invite-link.</div>
         <div class="row">
-          <input id="instanceCode" type="text" placeholder="instance code" />
           <input id="instancePassword" type="password" placeholder="password" />
           <button id="studentLoginBtn">Log ind</button>
         </div>
@@ -921,10 +920,16 @@ STUDENT_UI_HTML = """<!doctype html>
       const loginCard = document.getElementById("loginCard");
       const studentCard = document.getElementById("studentCard");
       const loginState = document.getElementById("loginState");
+      const loginHint = document.getElementById("studentLoginHint");
       const studentState = document.getElementById("studentState");
       const instanceTitle = document.getElementById("instanceTitle");
       const answerEl = document.getElementById("studentAnswer");
       const sourcesEl = document.getElementById("studentSources");
+      const pathMatch = window.location.pathname.match(/^\\/student\\/i\\/([^/]+)$/);
+      const defaultInstanceCode = pathMatch ? decodeURIComponent(pathMatch[1] || "").toUpperCase() : "";
+      if (!defaultInstanceCode) {
+        loginHint.innerHTML = '<span class="err">Åbn via invite-link fra underviser.</span>';
+      }
 
       function escapeHtml(text) {
         const d = document.createElement("div");
@@ -962,10 +967,14 @@ STUDENT_UI_HTML = """<!doctype html>
 
       document.getElementById("studentLoginBtn").addEventListener("click", async () => {
         try {
-          const instance_code = document.getElementById("instanceCode").value.trim();
+          const instance_code = defaultInstanceCode;
           const password = document.getElementById("instancePassword").value.trim();
-          if (!instance_code || !password) {
-            loginState.innerHTML = '<span class="err">Udfyld code og password.</span>';
+          if (!instance_code) {
+            loginState.innerHTML = '<span class="err">Invite-link mangler instance kode.</span>';
+            return;
+          }
+          if (!password) {
+            loginState.innerHTML = '<span class="err">Udfyld password.</span>';
             return;
           }
           const data = await api("/student/login", {
@@ -1091,6 +1100,11 @@ def home() -> str:
 
 @app.get("/student", response_class=HTMLResponse)
 def student_home() -> str:
+    return STUDENT_UI_HTML
+
+
+@app.get("/student/i/{instance_code}", response_class=HTMLResponse)
+def student_home_instance(instance_code: str) -> str:
     return STUDENT_UI_HTML
 
 
