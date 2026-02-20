@@ -179,6 +179,51 @@ def ensure_schema(settings: Settings) -> None:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS bot_instances (
+                    id BIGSERIAL PRIMARY KEY,
+                    owner_username TEXT NOT NULL,
+                    source_course_id BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    instance_code TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    editable_instructions_snapshot TEXT NOT NULL,
+                    locked_safety_block_snapshot TEXT NOT NULL,
+                    effective_system_prompt_snapshot TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    published_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bot_instances_owner
+                ON bot_instances(owner_username);
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_instance_chunks (
+                    id BIGSERIAL PRIMARY KEY,
+                    instance_id BIGINT NOT NULL REFERENCES bot_instances(id) ON DELETE CASCADE,
+                    source_document_id BIGINT,
+                    filename TEXT NOT NULL,
+                    page_start INTEGER,
+                    chunk_index INTEGER,
+                    content TEXT NOT NULL,
+                    embedding vector,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bot_instance_chunks_instance_id
+                ON bot_instance_chunks(instance_id);
+                """
+            )
+            cur.execute(
+                """
                 SELECT EXISTS (
                     SELECT 1
                     FROM information_schema.columns
@@ -723,3 +768,309 @@ def delete_chat_messages_for_course(conn: psycopg.Connection, course_id: int) ->
         )
         rows = cur.fetchall()
     return len(rows)
+
+
+def create_bot_instance(
+    conn: psycopg.Connection,
+    owner_username: str,
+    source_course_id: int,
+    name: str,
+    instance_code: str,
+    password_hash: str,
+    editable_instructions_snapshot: str,
+    locked_safety_block_snapshot: str,
+    effective_system_prompt_snapshot: str,
+) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bot_instances (
+                owner_username,
+                source_course_id,
+                name,
+                instance_code,
+                password_hash,
+                is_active,
+                editable_instructions_snapshot,
+                locked_safety_block_snapshot,
+                effective_system_prompt_snapshot
+            )
+            VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
+            RETURNING id, owner_username, source_course_id, name, instance_code, is_active, created_at, published_at;
+            """,
+            (
+                owner_username,
+                source_course_id,
+                name,
+                instance_code,
+                password_hash,
+                editable_instructions_snapshot,
+                locked_safety_block_snapshot,
+                effective_system_prompt_snapshot,
+            ),
+        )
+        row = cur.fetchone()
+    return {
+        "id": row[0],
+        "owner_username": row[1],
+        "source_course_id": row[2],
+        "name": row[3],
+        "instance_code": row[4],
+        "is_active": row[5],
+        "created_at": row[6].isoformat() if isinstance(row[6], datetime) else row[6],
+        "published_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
+    }
+
+
+def copy_course_chunks_to_instance(
+    conn: psycopg.Connection,
+    source_course_id: int,
+    instance_id: int,
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bot_instance_chunks (
+                instance_id,
+                source_document_id,
+                filename,
+                page_start,
+                chunk_index,
+                content,
+                embedding
+            )
+            SELECT
+                %s,
+                d.id,
+                d.filename,
+                c.page_start,
+                c.chunk_index,
+                c.content,
+                c.embedding
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.course_id = %s
+            RETURNING id;
+            """,
+            (instance_id, source_course_id),
+        )
+        rows = cur.fetchall()
+    return len(rows)
+
+
+def list_bot_instances_for_owner(conn: psycopg.Connection, owner_username: str) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                i.id,
+                i.owner_username,
+                i.source_course_id,
+                i.name,
+                i.instance_code,
+                i.is_active,
+                i.created_at,
+                i.published_at,
+                COALESCE(cnt.chunk_count, 0) AS chunk_count
+            FROM bot_instances i
+            LEFT JOIN (
+                SELECT instance_id, COUNT(*) AS chunk_count
+                FROM bot_instance_chunks
+                GROUP BY instance_id
+            ) cnt ON cnt.instance_id = i.id
+            WHERE i.owner_username = %s
+            ORDER BY i.published_at DESC;
+            """,
+            (owner_username,),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "owner_username": row[1],
+            "source_course_id": row[2],
+            "name": row[3],
+            "instance_code": row[4],
+            "is_active": row[5],
+            "created_at": row[6].isoformat() if isinstance(row[6], datetime) else row[6],
+            "published_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
+            "chunk_count": row[8],
+        }
+        for row in rows
+    ]
+
+
+def get_bot_instance_for_owner(
+    conn: psycopg.Connection,
+    instance_id: int,
+    owner_username: str,
+) -> Optional[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                i.id,
+                i.owner_username,
+                i.source_course_id,
+                i.name,
+                i.instance_code,
+                i.password_hash,
+                i.is_active,
+                i.editable_instructions_snapshot,
+                i.locked_safety_block_snapshot,
+                i.effective_system_prompt_snapshot,
+                i.created_at,
+                i.published_at,
+                COALESCE(cnt.chunk_count, 0) AS chunk_count
+            FROM bot_instances i
+            LEFT JOIN (
+                SELECT instance_id, COUNT(*) AS chunk_count
+                FROM bot_instance_chunks
+                GROUP BY instance_id
+            ) cnt ON cnt.instance_id = i.id
+            WHERE i.id = %s
+              AND i.owner_username = %s
+            LIMIT 1;
+            """,
+            (instance_id, owner_username),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "owner_username": row[1],
+        "source_course_id": row[2],
+        "name": row[3],
+        "instance_code": row[4],
+        "password_hash": row[5],
+        "is_active": row[6],
+        "editable_instructions_snapshot": row[7],
+        "locked_safety_block_snapshot": row[8],
+        "effective_system_prompt_snapshot": row[9],
+        "created_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
+        "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+        "chunk_count": row[12],
+    }
+
+
+def set_bot_instance_status(
+    conn: psycopg.Connection,
+    instance_id: int,
+    owner_username: str,
+    is_active: bool,
+) -> Optional[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE bot_instances
+            SET is_active = %s
+            WHERE id = %s
+              AND owner_username = %s
+            RETURNING id;
+            """,
+            (is_active, instance_id, owner_username),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+    return get_bot_instance_for_owner(conn, instance_id, owner_username)
+
+
+def get_bot_instance_by_code(conn: psycopg.Connection, instance_code: str) -> Optional[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                i.id,
+                i.owner_username,
+                i.source_course_id,
+                i.name,
+                i.instance_code,
+                i.password_hash,
+                i.is_active,
+                i.editable_instructions_snapshot,
+                i.locked_safety_block_snapshot,
+                i.effective_system_prompt_snapshot,
+                i.created_at,
+                i.published_at,
+                COALESCE(cnt.chunk_count, 0) AS chunk_count
+            FROM bot_instances i
+            LEFT JOIN (
+                SELECT instance_id, COUNT(*) AS chunk_count
+                FROM bot_instance_chunks
+                GROUP BY instance_id
+            ) cnt ON cnt.instance_id = i.id
+            WHERE i.instance_code = %s
+            LIMIT 1;
+            """,
+            (instance_code,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "owner_username": row[1],
+        "source_course_id": row[2],
+        "name": row[3],
+        "instance_code": row[4],
+        "password_hash": row[5],
+        "is_active": row[6],
+        "editable_instructions_snapshot": row[7],
+        "locked_safety_block_snapshot": row[8],
+        "effective_system_prompt_snapshot": row[9],
+        "created_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
+        "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+        "chunk_count": row[12],
+    }
+
+
+def get_bot_instance_by_id(conn: psycopg.Connection, instance_id: int) -> Optional[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                i.id,
+                i.owner_username,
+                i.source_course_id,
+                i.name,
+                i.instance_code,
+                i.password_hash,
+                i.is_active,
+                i.editable_instructions_snapshot,
+                i.locked_safety_block_snapshot,
+                i.effective_system_prompt_snapshot,
+                i.created_at,
+                i.published_at,
+                COALESCE(cnt.chunk_count, 0) AS chunk_count
+            FROM bot_instances i
+            LEFT JOIN (
+                SELECT instance_id, COUNT(*) AS chunk_count
+                FROM bot_instance_chunks
+                GROUP BY instance_id
+            ) cnt ON cnt.instance_id = i.id
+            WHERE i.id = %s
+            LIMIT 1;
+            """,
+            (instance_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "owner_username": row[1],
+        "source_course_id": row[2],
+        "name": row[3],
+        "instance_code": row[4],
+        "password_hash": row[5],
+        "is_active": row[6],
+        "editable_instructions_snapshot": row[7],
+        "locked_safety_block_snapshot": row[8],
+        "effective_system_prompt_snapshot": row[9],
+        "created_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
+        "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+        "chunk_count": row[12],
+    }

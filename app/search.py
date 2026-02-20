@@ -56,3 +56,46 @@ def search_chunks(
         )
 
     return results
+
+
+def search_instance_chunks(
+    query: str,
+    settings: Settings,
+    top_k: int,
+    instance_id: int,
+) -> List[Dict[str, Any]]:
+    if not query.strip():
+        return []
+
+    embedding = Vector(embed_text(query, settings))
+
+    with get_connection(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    filename,
+                    page_start,
+                    chunk_index,
+                    content,
+                    (embedding <=> %s) AS distance
+                FROM bot_instance_chunks
+                WHERE embedding IS NOT NULL
+                  AND instance_id = %s
+                ORDER BY embedding <=> %s
+                LIMIT %s;
+                """,
+                (embedding, instance_id, embedding, top_k),
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "filename": row[0],
+            "page_start": row[1],
+            "chunk_index": row[2],
+            "content": row[3],
+            "distance": float(row[4]) if row[4] is not None else None,
+        }
+        for row in rows
+    ]
