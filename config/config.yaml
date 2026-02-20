@@ -1,0 +1,22 @@
+app:
+  env: dev
+  host: 0.0.0.0
+  port: 8000
+paths:
+  data_root: ./data
+  upload_root: ./data/uploads
+embeddings:
+  provider: ollama
+  base_url: http://localhost:11434
+  model: bge-m3
+chat:
+  model: gemma3
+postgres:
+  host: localhost
+  port: 5432
+  db: ppl_rag
+  user: ppl
+  password_env: DB_PASSWORD
+auth:
+  password_env: AUTH_PASSWORD
+  ttl_seconds: 43200

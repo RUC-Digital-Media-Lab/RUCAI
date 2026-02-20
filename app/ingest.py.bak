@@ -1,0 +1,140 @@
+import argparse
+import logging
+from pathlib import Path
+from typing import Optional
+
+from docling.document_converter import DocumentConverter
+from pypdf import PdfReader
+
+from .chunking import chunk_text, iter_nonempty, normalize_text
+from .config import load_settings
+from .db import clear_chunks, get_connection, get_or_create_document, insert_chunk
+from .embeddings import embed_text
+
+
+logger = logging.getLogger("ppl_rag.ingest")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def extract_page_text_pypdf(reader: PdfReader, page_number: int) -> str:
+    page = reader.pages[page_number - 1]
+    return page.extract_text() or ""
+
+
+def extract_page_text_docling(
+    converter: DocumentConverter, pdf_path: Path, page_number: int
+) -> str:
+    result = converter.convert(str(pdf_path), page_range=(page_number, page_number))
+    if result.document is None:
+        return ""
+    return result.document.export_to_text()
+
+
+def is_ocr_noise(text: str, min_chars: int, min_alpha_ratio: float) -> bool:
+    nonspace = [c for c in text if not c.isspace()]
+    if len(nonspace) < min_chars:
+        return False
+    alpha = sum(1 for c in nonspace if c.isalpha())
+    ratio = alpha / len(nonspace) if nonspace else 0.0
+    return ratio < min_alpha_ratio
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ingest PDFs into pgvector.")
+    parser.add_argument("--root", default=None, help="Root data directory.")
+    parser.add_argument(
+        "--subdir",
+        default=None,
+        help="Subdirectory under root to index (e.g., articles_scanned).",
+    )
+    parser.add_argument("--min-chars", type=int, default=200)
+    parser.add_argument("--max-words", type=int, default=800)
+    parser.add_argument("--overlap", type=int, default=100)
+    parser.add_argument("--min-ocr-chars", type=int, default=80)
+    parser.add_argument("--min-alpha-ratio", type=float, default=0.5)
+    parser.add_argument("--no-embed", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    settings = load_settings()
+
+    data_root = Path(args.root) if args.root else settings.data_root
+    target_dir = data_root / args.subdir if args.subdir else data_root
+
+    if not target_dir.exists():
+        raise FileNotFoundError(f"Missing data directory: {target_dir}")
+
+    pdf_paths = sorted(target_dir.rglob("*.pdf"))
+    if not pdf_paths:
+        logger.info("No PDFs found under %s", target_dir)
+        return
+
+    converter: Optional[DocumentConverter] = None
+
+    with get_connection(settings) as conn:
+        for pdf_path in pdf_paths:
+            logger.info("Indexing %s", pdf_path)
+            reader = PdfReader(str(pdf_path))
+
+            doc_id = get_or_create_document(
+                conn,
+                path=str(pdf_path),
+                filename=pdf_path.name,
+                source=str(target_dir),
+            )
+            clear_chunks(conn, doc_id)
+
+            chunk_index = 0
+            for page_number in range(1, len(reader.pages) + 1):
+                raw_text = extract_page_text_pypdf(reader, page_number)
+                cleaned = normalize_text(raw_text)
+
+                use_docling = len(cleaned) < args.min_chars
+                if use_docling:
+                    if converter is None:
+                        converter = DocumentConverter()
+                    try:
+                        docling_text = extract_page_text_docling(
+                            converter, pdf_path, page_number
+                        )
+                        cleaned = normalize_text(docling_text)
+                    except Exception as exc:
+                        logger.warning(
+                            "Docling failed on %s page %s: %s",
+                            pdf_path,
+                            page_number,
+                            exc,
+                        )
+
+                if not cleaned:
+                    continue
+
+                for chunk in iter_nonempty(
+                    chunk_text(cleaned, args.max_words, args.overlap)
+                ):
+                    if is_ocr_noise(chunk, args.min_ocr_chars, args.min_alpha_ratio):
+                        continue
+
+                    embedding = None
+                    if not args.no_embed:
+                        embedding = embed_text(chunk, settings)
+
+                    insert_chunk(
+                        conn,
+                        document_id=doc_id,
+                        chunk_index=chunk_index,
+                        page_start=page_number,
+                        page_end=page_number,
+                        section_title=None,
+                        content=chunk,
+                        embedding=embedding,
+                    )
+                    chunk_index += 1
+
+            conn.commit()
+
+
+if __name__ == "__main__":
+    main()

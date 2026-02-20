@@ -1,0 +1,11 @@
+docling
+pypdf
+psycopg[binary]
+pgvector
+fastapi
+uvicorn
+pydantic
+python-dotenv
+python-multipart
+httpx
+pytest
