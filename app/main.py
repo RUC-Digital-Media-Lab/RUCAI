@@ -354,6 +354,33 @@ WEB_UI_HTML = """<!doctype html>
         chatHistoryEl.innerHTML = '<div class="small">Opret et kursus for at starte chat-historik.</div>';
       }
 
+      function buildInviteText(instanceCode, passwordText) {
+        const studentUrl = `${window.location.origin}/student`;
+        const passwordLine = passwordText && passwordText.trim()
+          ? passwordText.trim()
+          : "[det password du valgte ved publish]";
+        return [
+          "RUCAI student adgang",
+          `URL: ${studentUrl}`,
+          `Instance code: ${instanceCode}`,
+          `Password: ${passwordLine}`,
+        ].join("\\n");
+      }
+
+      async function copyToClipboard(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+        const t = document.createElement("textarea");
+        t.value = text;
+        document.body.appendChild(t);
+        t.select();
+        document.execCommand("copy");
+        document.body.removeChild(t);
+        return true;
+      }
+
       async function api(path, options = {}) {
         const headers = options.headers || {};
         if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -459,6 +486,7 @@ WEB_UI_HTML = """<!doctype html>
               <strong>${escapeHtml(i.name)}</strong>
               <div class="mono">code=${escapeHtml(i.instance_code)} | chunks=${i.chunk_count} | status=${i.is_active ? "active" : "inactive"}</div>
               <div class="row">
+                <button data-action="copy-invite" data-id="${i.id}" data-code="${escapeHtml(i.instance_code)}">Copy Invite</button>
                 <button data-action="instance-on" data-id="${i.id}">Activate</button>
                 <button data-action="instance-off" data-id="${i.id}" class="warn">Deactivate</button>
               </div>
@@ -603,14 +631,17 @@ WEB_UI_HTML = """<!doctype html>
             instancesState.innerHTML = '<span class="err">Name og password er påkrævet.</span>';
             return;
           }
-          await api("/instances", {
+          const created = await api("/instances", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name, instance_code: instance_code || null, instance_password }),
           });
+          const actualCode = created?.instance?.instance_code || instance_code || "";
+          const inviteText = buildInviteText(actualCode, instance_password);
+          await copyToClipboard(inviteText);
           document.getElementById("instanceCode").value = "";
           document.getElementById("instancePassword").value = "";
-          instancesState.innerHTML = '<span class="ok">Instance publiceret.</span>';
+          instancesState.innerHTML = '<span class="ok">Instance publiceret. Invite kopieret.</span>';
           await refreshInstances();
         } catch (err) {
           instancesState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -733,8 +764,17 @@ WEB_UI_HTML = """<!doctype html>
         if (!(target instanceof HTMLElement)) return;
         const action = target.getAttribute("data-action");
         const instanceId = target.getAttribute("data-id");
-        if (!action || !instanceId) return;
+        if (!action) return;
         try {
+          if (action === "copy-invite") {
+            const code = target.getAttribute("data-code");
+            if (!code) return;
+            const inviteText = buildInviteText(code, "");
+            await copyToClipboard(inviteText);
+            instancesState.innerHTML = '<span class="ok">Invite kopieret.</span>';
+            return;
+          }
+          if (!instanceId) return;
           if (action === "instance-on") {
             await api(`/instances/${instanceId}/status`, {
               method: "PUT",
