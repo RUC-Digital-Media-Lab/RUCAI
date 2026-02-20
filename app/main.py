@@ -355,17 +355,8 @@ WEB_UI_HTML = """<!doctype html>
         chatHistoryEl.innerHTML = '<div class="small">Opret et kursus for at starte chat-historik.</div>';
       }
 
-      function buildInviteText(instanceCode, passwordText) {
-        const studentUrl = `${window.location.origin}/student/i/${instanceCode}`;
-        const passwordLine = passwordText && passwordText.trim()
-          ? passwordText.trim()
-          : "[det password du valgte ved publish]";
-        return [
-          "RUCAI student adgang",
-          `URL: ${studentUrl}`,
-          `Instance code: ${instanceCode}`,
-          `Password: ${passwordLine}`,
-        ].join("\\n");
+      function buildStudentUrl(instanceCode) {
+        return `${window.location.origin}/student/i/${instanceCode}`;
       }
 
       async function copyToClipboard(text) {
@@ -638,8 +629,8 @@ WEB_UI_HTML = """<!doctype html>
             body: JSON.stringify({ name, instance_code: instance_code || null, instance_password }),
           });
           const actualCode = created?.instance?.instance_code || instance_code || "";
-          const inviteText = buildInviteText(actualCode, instance_password);
-          await copyToClipboard(inviteText);
+          const studentUrl = buildStudentUrl(actualCode);
+          await copyToClipboard(studentUrl);
           document.getElementById("instanceCode").value = "";
           document.getElementById("instancePassword").value = "";
           instancesState.innerHTML = '<span class="ok">Instance publiceret. Invite kopieret.</span>';
@@ -770,9 +761,9 @@ WEB_UI_HTML = """<!doctype html>
           if (action === "copy-invite") {
             const code = target.getAttribute("data-code");
             if (!code) return;
-            const inviteText = buildInviteText(code, "");
-            await copyToClipboard(inviteText);
-            instancesState.innerHTML = '<span class="ok">Invite kopieret.</span>';
+            const studentUrl = buildStudentUrl(code);
+            await copyToClipboard(studentUrl);
+            instancesState.innerHTML = '<span class="ok">Link kopieret.</span>';
             return;
           }
           if (!instanceId) return;
