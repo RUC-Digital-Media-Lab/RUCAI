@@ -163,6 +163,14 @@ WEB_UI_HTML = """<!doctype html>
       .history-item { margin-bottom: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,0.65); }
       .history-role { font-weight: 700; font-size: 12px; color: var(--muted); text-transform: uppercase; }
       .history-time { font-size: 11px; color: var(--muted); margin-top: 4px; }
+      .chat-compose { display: flex; gap: 8px; align-items: stretch; margin-top: 8px; }
+      .chat-compose textarea { margin: 0; }
+      .chat-actions { display: flex; flex-direction: column; gap: 8px; width: 180px; }
+      .chat-actions button { width: 100%; }
+      @media (max-width: 960px) {
+        .chat-compose { flex-direction: column; }
+        .chat-actions { width: 100%; }
+      }
     </style>
   </head>
   <body>
@@ -286,16 +294,18 @@ WEB_UI_HTML = """<!doctype html>
         <div class="row">
           <label for="topK" class="small">Kilder pr. svar (k)</label>
           <input id="topK" type="number" min="1" max="50" value="5" />
-          <button id="chatBtn" class="primary">Spørg</button>
-          <button id="newChatBtn" class="warn">Ny samtale</button>
         </div>
         <div id="chatStatus" class="small"></div>
         <div id="answer" class="answer"></div>
         <div id="sources"></div>
         <div class="small"><strong>Samtalehistorik</strong> (for aktivt kursus)</div>
         <div id="chatHistory" class="history"></div>
-        <div class="row">
+        <div class="chat-compose">
           <textarea id="question" placeholder="Spørg ind til pensum, teksterne eller øvelserne..."></textarea>
+          <div class="chat-actions">
+            <button id="chatBtn" class="primary">Spørg</button>
+            <button id="newChatBtn" class="warn">Ny samtale</button>
+          </div>
         </div>
       </section>
     </main>
