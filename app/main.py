@@ -185,19 +185,18 @@ WEB_UI_HTML = """<!doctype html>
     <main id="appShell" class="layout hidden">
       <header class="header">
         <h1>RUCAI</h1>
-        <p>Underviser-copilot til kursusforankrede svar, upload og sparring.</p>
         <div class="header-actions">
           <button id="logoutTopBtn" class="warn">Log ud</button>
         </div>
       </header>
 
       <section class="card">
-        <h3>Documentation</h3>
+        <h3>Hvad er RUCAI?</h3>
         <div class="small">
-          RUCAI hjælper undervisere med at arbejde direkte i kursusmaterialet.
-          1) Vælg eller opret et kursus. 2) Upload PDF/DOCX og vælg scanningstype.
-          3) Stil spørgsmål i chatten og brug kildehenvisningerne til planlægning, begrebsafklaring og øvelsesdesign.
-          Chat-historik gemmes pr. kursus, så samtaler kan fortsætte over tid.
+          RUCAI er sat i verden til at understøtte kursusplanlægning og afvikling.
+          Ideen er at underviser kan designe og tilrettelægge undervisning med udgangspunkt i kursusbeskrivelse og pensum
+          og så oprette ”chat” vinduer, som studerende så kan tilgå i forbindelse med undervisning.
+          Chat-historik gemmes pr. kursusgang, så samtaler kan fortsætte over tid.
         </div>
       </section>
 
@@ -212,7 +211,7 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card" id="activeCourseCard">
-        <h3>Aktivt Kursus</h3>
+        <h3>Information om kursus</h3>
         <div class="row">
           <input id="courseTitle" type="text" placeholder="Course title" />
         </div>
@@ -220,15 +219,15 @@ WEB_UI_HTML = """<!doctype html>
           <textarea id="courseDesc" placeholder="Course description"></textarea>
         </div>
         <div class="row">
-          <button id="setCourseBtn" class="primary">Set Active Course</button>
+          <button id="setCourseBtn" class="primary">Placer kursusbeskrivelse og titel i systemprompt</button>
           <button id="refreshCourseBtn">Refresh</button>
         </div>
         <div id="courseState" class="small"></div>
       </section>
 
       <section class="card">
-        <h3>Course Prompt</h3>
-        <div class="small">Du kan redigere undervisningsinstruktionen. Sikkerhedsblokken er låst.</div>
+        <h3>Kursusprompt</h3>
+        <div class="small">Du kan redigere undervisningsinstruktionen. Nogle grundregler er faste for at sikre kildebaserede og ansvarlige svar.</div>
         <div class="row">
           <textarea id="promptEditable" placeholder="Editable course instructions"></textarea>
         </div>
@@ -237,7 +236,7 @@ WEB_UI_HTML = """<!doctype html>
           <button id="refreshPromptBtn">Refresh Prompt</button>
         </div>
         <details class="small">
-          <summary>Låst sikkerhedsblok</summary>
+          <summary>Faste grundregler (kan ikke redigeres)</summary>
           <pre id="promptLocked"></pre>
         </details>
         <details class="small">
@@ -283,10 +282,7 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card">
-        <h3>Chat With Curriculum</h3>
-        <div class="row">
-          <textarea id="question" placeholder="Ask a curriculum question..."></textarea>
-        </div>
+        <h3>Chat med pensum.</h3>
         <div class="row">
           <label for="topK" class="small">Kilder pr. svar (k)</label>
           <input id="topK" type="number" min="1" max="50" value="5" />
@@ -298,6 +294,9 @@ WEB_UI_HTML = """<!doctype html>
         <div id="sources"></div>
         <div class="small"><strong>Samtalehistorik</strong> (for aktivt kursus)</div>
         <div id="chatHistory" class="history"></div>
+        <div class="row">
+          <textarea id="question" placeholder="Spørg ind til pensum, teksterne eller øvelserne..."></textarea>
+        </div>
       </section>
     </main>
 
@@ -609,7 +608,7 @@ WEB_UI_HTML = """<!doctype html>
       document.getElementById("newCourseBtn").addEventListener("click", () => {
         document.getElementById("courseTitle").value = "";
         document.getElementById("courseDesc").value = "";
-        courseState.innerHTML = '<span class="ok">Udfyld titel og beskrivelse og klik "Set Active Course".</span>';
+        courseState.innerHTML = '<span class="ok">Udfyld titel og beskrivelse og klik "Placer kursusbeskrivelse og titel i systemprompt".</span>';
         document.getElementById("activeCourseCard").scrollIntoView({ behavior: "smooth", block: "start" });
         document.getElementById("courseTitle").focus();
       });
