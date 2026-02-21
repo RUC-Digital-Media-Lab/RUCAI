@@ -12,11 +12,17 @@ def search_chunks(
     settings: Settings,
     top_k: int,
     course_id: int,
+    *,
+    diversify_by_document: bool = False,
+    max_per_document: int = 2,
+    candidate_multiplier: int = 8,
 ) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
 
     embedding = Vector(embed_text(query, settings))
+
+    candidate_limit = max(top_k, top_k * max(1, candidate_multiplier))
 
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
@@ -37,7 +43,7 @@ def search_chunks(
                 ORDER BY c.embedding <=> %s
                 LIMIT %s;
                 """,
-                (embedding, course_id, embedding, top_k),
+                (embedding, course_id, embedding, candidate_limit),
             )
             rows = cur.fetchall()
 
@@ -55,7 +61,32 @@ def search_chunks(
             }
         )
 
-    return results
+    if not diversify_by_document:
+        return results[:top_k]
+
+    # Keep relevance ordering but prevent one document from dominating.
+    per_doc_used: Dict[str, int] = {}
+    selected: List[Dict[str, Any]] = []
+    for item in results:
+        key = str(item["path"])
+        used = per_doc_used.get(key, 0)
+        if used >= max(1, max_per_document):
+            continue
+        selected.append(item)
+        per_doc_used[key] = used + 1
+        if len(selected) >= top_k:
+            break
+
+    if len(selected) < top_k:
+        seen_ids = {id(x) for x in selected}
+        for item in results:
+            if id(item) in seen_ids:
+                continue
+            selected.append(item)
+            if len(selected) >= top_k:
+                break
+
+    return selected
 
 
 def search_instance_chunks(

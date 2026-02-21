@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from secrets import choice
 from typing import List, Optional
@@ -19,7 +20,7 @@ from .auth import (
     require_student_auth,
     verify_password,
 )
-from .chat import chat_response
+from .chat import build_grouped_sources, chat_response
 from .config import ensure_data_dirs, load_settings
 from .db import (
     course_belongs_to_owner,
@@ -106,9 +107,10 @@ WEB_UI_HTML = """<!doctype html>
       .layout > .header { grid-column: 1 / -1; }
       .layout > .sidebar { grid-column: 1; align-self: start; position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; }
       .layout > .card:not(.sidebar) { grid-column: 2; }
+      .layout > .split-two { grid-column: 2; }
       @media (max-width: 960px) {
         .layout { grid-template-columns: 1fr; }
-        .layout > .sidebar, .layout > .card, .layout > .header { grid-column: 1; position: static; }
+        .layout > .sidebar, .layout > .card, .layout > .header, .layout > .split-two { grid-column: 1; position: static; }
       }
       .header { padding: 0.2rem; }
       .header { position: relative; }
@@ -149,6 +151,12 @@ WEB_UI_HTML = """<!doctype html>
       }
       button.primary { background: linear-gradient(135deg, var(--accent), var(--accent-dark)); color: #fff; border-color: transparent; }
       button.warn { background: linear-gradient(135deg, var(--accent-2), #de6f11); color: #fff; border-color: transparent; }
+      button:disabled { opacity: 0.72; cursor: not-allowed; }
+      button.busy { animation: busyPulse 1s ease-in-out infinite; }
+      @keyframes busyPulse {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(0.985); }
+      }
       .small { font-size: 13px; color: var(--muted); margin-top: 8px; }
       .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
       .ok { color: var(--ok); }
@@ -163,13 +171,74 @@ WEB_UI_HTML = """<!doctype html>
       .history-item { margin-bottom: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,0.65); }
       .history-role { font-weight: 700; font-size: 12px; color: var(--muted); text-transform: uppercase; }
       .history-time { font-size: 11px; color: var(--muted); margin-top: 4px; }
+      .thinking { display: inline-flex; align-items: center; gap: 4px; }
+      .thinking-dots { display: inline-flex; min-width: 22px; }
+      .thinking-dots span { opacity: 0.2; animation: thinkingBlink 1.2s infinite; }
+      .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+      .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+      @keyframes thinkingBlink {
+        0%, 80%, 100% { opacity: 0.2; }
+        40% { opacity: 1; }
+      }
       .chat-compose { display: flex; gap: 8px; align-items: stretch; margin-top: 8px; }
       .chat-compose textarea { margin: 0; }
       .chat-actions { display: flex; flex-direction: column; gap: 8px; width: 180px; }
       .chat-actions button { width: 100%; }
+      .split-two {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+      }
+      .split-two .card { margin: 0; }
+      .tip-wrap {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        margin-left: 6px;
+        vertical-align: middle;
+      }
+      .tip-icon {
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--accent-dark);
+        background: rgba(255, 255, 255, 0.9);
+        cursor: help;
+      }
+      .tip-text {
+        position: absolute;
+        left: 0;
+        top: 24px;
+        width: 320px;
+        max-width: min(80vw, 320px);
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 9px 10px;
+        box-shadow: 0 12px 26px rgba(16, 22, 19, 0.12);
+        color: var(--ink);
+        font-size: 12px;
+        line-height: 1.35;
+        visibility: hidden;
+        opacity: 0;
+        transition: opacity 0.15s ease;
+        z-index: 40;
+      }
+      .tip-wrap:hover .tip-text,
+      .tip-wrap:focus-within .tip-text {
+        visibility: visible;
+        opacity: 1;
+      }
       @media (max-width: 960px) {
         .chat-compose { flex-direction: column; }
         .chat-actions { width: 100%; }
+        .split-two { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -179,11 +248,11 @@ WEB_UI_HTML = """<!doctype html>
 
     <div id="loginGate" class="gate-wrap">
       <section class="gate-card">
-        <h2 class="gate-title">RUCAI Login</h2>
+        <h2 class="gate-title">RUCAI Log ind</h2>
         <p class="gate-sub">Log ind for at åbne platformen.</p>
         <div class="row">
-          <input id="username" type="text" placeholder="username" />
-          <input id="password" type="password" placeholder="password" />
+          <input id="username" type="text" placeholder="brugernavn" />
+          <input id="password" type="password" placeholder="adgangskode" />
           <button id="loginBtn" class="primary">Log ind</button>
         </div>
         <div id="authState" class="small"></div>
@@ -194,8 +263,13 @@ WEB_UI_HTML = """<!doctype html>
       <header class="header">
         <h1>RUCAI</h1>
         <div class="header-actions">
+          <select id="chatModelSelect" style="min-width:220px;">
+            <option value="">Vælg model…</option>
+          </select>
+          <button id="saveModelBtn">Gem model</button>
           <button id="logoutTopBtn" class="warn">Log ud</button>
         </div>
+        <div id="modelState" class="small"></div>
       </header>
 
       <section class="card">
@@ -219,7 +293,7 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card" id="activeCourseCard">
-        <h3>Information om kursus</h3>
+        <h3>Information om kurset</h3>
         <div class="row">
           <input id="courseTitle" type="text" placeholder="Kursustitel" />
         </div>
@@ -228,20 +302,25 @@ WEB_UI_HTML = """<!doctype html>
         </div>
         <div class="row">
           <button id="setCourseBtn" class="primary">Placer kursusbeskrivelse og titel i systemprompt</button>
-          <button id="refreshCourseBtn">Opdater</button>
+          <button id="refreshCourseBtn">Genindlæs visning</button>
         </div>
         <div id="courseState" class="small"></div>
       </section>
 
       <section class="card">
-        <h3>Kursusprompt</h3>
+        <h3>Kursusprompt
+          <span class="tip-wrap">
+            <span class="tip-icon" tabindex="0" aria-label="Tips til prompt-teknik">I</span>
+            <span class="tip-text">God prompt-teknik: Vær konkret om målgruppe, læringsmål, ønsket svarformat og længde. Bed om kildehenvisninger, og sig tydeligt hvad modellen skal gøre ved usikkerhed.</span>
+          </span>
+        </h3>
         <div class="small">Du kan redigere undervisningsinstruktionen. Nogle grundregler er faste for at sikre kildebaserede og ansvarlige svar.</div>
         <div class="row">
           <textarea id="promptEditable" placeholder="Redigerbar kursusinstruktion"></textarea>
         </div>
         <div class="row">
           <button id="savePromptBtn" class="primary">Gem kursusprompt</button>
-          <button id="refreshPromptBtn">Opdater kursusprompt</button>
+          <button id="refreshPromptBtn">Hent kursusprompt</button>
         </div>
         <details class="small">
           <summary>Faste grundregler (kan ikke redigeres)</summary>
@@ -254,43 +333,29 @@ WEB_UI_HTML = """<!doctype html>
         <div id="promptState" class="small"></div>
       </section>
 
-      <section class="card">
-        <h3>Studenter-chatvinduer</h3>
-        <div class="small">Publicér en låst chatbot til studerende ud fra aktivt kursus.</div>
-        <div class="row">
-          <input id="instanceName" type="text" placeholder="Navn på chatvindue (fx Hold A Forår 2026)" />
-        </div>
-        <div class="row">
-          <input id="instanceCode" type="text" placeholder="Kode (valgfri, autogenereres hvis tom)" />
-          <input id="instancePassword" type="password" placeholder="Adgangskode til studerende" />
-          <button id="publishInstanceBtn" class="primary">Publish</button>
-          <button id="refreshInstancesBtn">Opdater</button>
-        </div>
-        <div id="instancesState" class="small"></div>
-        <div id="instancesList" class="stack"></div>
+      <section class="split-two">
+        <section class="card">
+          <h3>Upload PDF/DOCX</h3>
+          <div class="row">
+            <input id="docFile" type="file" multiple accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+            <button id="uploadBtn" class="primary">Upload og indlæs</button>
+          </div>
+          <div id="scanModeList" class="small"></div>
+          <div id="ingestState" class="small"></div>
+        </section>
+
+        <section class="card">
+          <h3>Dokumenter</h3>
+          <div class="row">
+            <button id="refreshDocsBtn">Genindlæs dokumentliste</button>
+          </div>
+          <div id="docsState" class="small"></div>
+          <div id="docsList" class="stack"></div>
+        </section>
       </section>
 
       <section class="card">
-        <h3>Dokumenter</h3>
-        <div class="row">
-          <button id="refreshDocsBtn">Opdater dokumenter</button>
-        </div>
-        <div id="docsState" class="small"></div>
-        <div id="docsList" class="stack"></div>
-      </section>
-
-      <section class="card">
-        <h3>Upload PDF/DOCX</h3>
-        <div class="row">
-          <input id="docFile" type="file" multiple accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
-          <button id="uploadBtn" class="primary">Upload og indlæs</button>
-        </div>
-        <div id="scanModeList" class="small"></div>
-        <div id="ingestState" class="small"></div>
-      </section>
-
-      <section class="card">
-        <h3>Chat med pensum.</h3>
+        <h3>Chat</h3>
         <div class="row">
           <label for="topK" class="small">Kilder pr. svar (k)</label>
           <input id="topK" type="number" min="1" max="50" value="5" />
@@ -308,6 +373,23 @@ WEB_UI_HTML = """<!doctype html>
           </div>
         </div>
       </section>
+
+      <section class="card">
+        <h3>Skab studenter-chatvinduer</h3>
+        <div class="small">Publicér en låst chatbot til studerende ud fra aktivt kursus.</div>
+        <div class="row">
+          <input id="instanceName" type="text" placeholder="Navn på chatvindue (fx Hold A Forår 2026)" />
+        </div>
+        <div class="row">
+          <input id="instanceCode" type="text" placeholder="Kode (valgfri, autogenereres hvis tom)" />
+          <input id="instancePassword" type="password" placeholder="Adgangskode til studerende" />
+          <button id="publishInstanceBtn" class="primary">Publicér</button>
+          <button id="refreshInstancesBtn">Genindlæs chatvinduer</button>
+        </div>
+        <div id="instancesState" class="small"></div>
+        <div id="instancesList" class="stack"></div>
+      </section>
+
     </main>
 
     <script>
@@ -326,6 +408,7 @@ WEB_UI_HTML = """<!doctype html>
       const sourcesEl = document.getElementById("sources");
       const chatHistoryEl = document.getElementById("chatHistory");
       const promptState = document.getElementById("promptState");
+      const modelState = document.getElementById("modelState");
       const promptEditableEl = document.getElementById("promptEditable");
       const promptLockedEl = document.getElementById("promptLocked");
       const promptPreviewEl = document.getElementById("promptPreview");
@@ -338,6 +421,143 @@ WEB_UI_HTML = """<!doctype html>
         const d = document.createElement("div");
         d.innerText = String(text ?? "");
         return d.innerHTML;
+      }
+
+      function markdownToHtml(md) {
+        const lines = String(md || "").split("\\n");
+        const out = [];
+        let inList = false;
+        const inline = (txt) => escapeHtml(txt)
+          .replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>")
+          .replace(/\\*(.+?)\\*/g, "<em>$1</em>")
+          .replace(/`([^`]+)`/g, "<code>$1</code>");
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line) {
+            if (inList) { out.push("</ul>"); inList = false; }
+            continue;
+          }
+          const bullet = line.match(/^[-*]\\s+(.+)$/);
+          if (bullet) {
+            if (!inList) { out.push("<ul>"); inList = true; }
+            out.push(`<li>${inline(bullet[1])}</li>`);
+            continue;
+          }
+          if (inList) { out.push("</ul>"); inList = false; }
+          out.push(`<p>${inline(line)}</p>`);
+        }
+        if (inList) out.push("</ul>");
+        return out.join("");
+      }
+
+      function renderGroupedSources(container, data) {
+        container.innerHTML = "";
+        const grouped = Array.isArray(data?.sources) ? data.sources : [];
+        if (grouped.length > 0) {
+          grouped.forEach((src) => {
+            const div = document.createElement("div");
+            div.className = "source";
+            const snippets = Array.isArray(src.snippets) ? src.snippets : [];
+            const snippetHtml = snippets.map((sn) => `
+              <div style="margin-top:6px;">p${escapeHtml(String(sn.page_start ?? "?"))}: ${escapeHtml(String(sn.content || ""))}</div>
+            `).join("");
+            div.innerHTML = `<strong>[${escapeHtml(String(src.ref ?? "?"))}] ${escapeHtml(String(src.filename || "Ukendt kilde"))}</strong>${snippetHtml}`;
+            container.appendChild(div);
+          });
+          return;
+        }
+
+        (data?.contexts || []).forEach((ctx) => {
+          const div = document.createElement("div");
+          div.className = "source";
+          div.innerHTML = `<strong>${escapeHtml(ctx.filename)}</strong> p${escapeHtml(ctx.page_start)}<br>${escapeHtml(ctx.content || "")}`;
+          container.appendChild(div);
+        });
+      }
+
+      function renderGroupedSources(container, data) {
+        container.innerHTML = "";
+        const grouped = Array.isArray(data?.sources) ? data.sources : [];
+        const maxPreviewChars = 240;
+        if (grouped.length > 0) {
+          grouped.forEach((src) => {
+            const wrapper = document.createElement("div");
+            wrapper.className = "source small";
+            const ref = escapeHtml(String(src.ref ?? "?"));
+            const filename = escapeHtml(String(src.filename || "Ukendt kilde"));
+            const snippets = Array.isArray(src.snippets) ? src.snippets : [];
+            const snippetsHtml = snippets.map((sn) => {
+              const fullText = String(sn.content || "");
+              const shortText = fullText.length > maxPreviewChars ? `${fullText.slice(0, maxPreviewChars)}...` : fullText;
+              return `
+                <div style="margin-top:6px;">
+                  p${escapeHtml(String(sn.page_start ?? "?"))} idx ${escapeHtml(String(sn.chunk_index ?? "?"))}<br>
+                  ${escapeHtml(shortText)}
+                  <details><summary>Vis hele uddraget</summary>${escapeHtml(fullText)}</details>
+                </div>
+              `;
+            }).join("");
+            wrapper.innerHTML = `<strong>[${ref}] ${filename}</strong>${snippetsHtml}`;
+            container.appendChild(wrapper);
+          });
+          return;
+        }
+
+        // Backward-compatible fallback if server does not provide grouped sources.
+        (data?.contexts || []).forEach((ctx) => {
+          const div = document.createElement("div");
+          div.className = "source small";
+          const fullText = String(ctx.content || "");
+          const shortText = fullText.length > maxPreviewChars ? `${fullText.slice(0, maxPreviewChars)}...` : fullText;
+          div.innerHTML = `
+            <strong>${escapeHtml(ctx.filename)}</strong> p${escapeHtml(ctx.page_start)} idx ${escapeHtml(ctx.chunk_index)}<br>
+            ${escapeHtml(shortText)}
+            <details><summary>Vis hele uddraget</summary>${escapeHtml(fullText)}</details>
+          `;
+          container.appendChild(div);
+        });
+      }
+
+      const thinkingIntervals = new Map();
+
+      function startThinking(el, label = "Tænker") {
+        stopThinking(el);
+        el.innerHTML = `<span class="thinking"><span>${escapeHtml(label)}</span><span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span></span>`;
+      }
+
+      function stopThinking(el) {
+        const timer = thinkingIntervals.get(el);
+        if (timer) {
+          clearInterval(timer);
+          thinkingIntervals.delete(el);
+        }
+      }
+
+      function startBusyButton(btn, label = "Arbejder") {
+        const original = btn.textContent || "";
+        btn.dataset.originalLabel = original;
+        btn.disabled = true;
+        btn.classList.add("busy");
+        let dots = 0;
+        btn.textContent = `${label}.`;
+        const timer = setInterval(() => {
+          dots = (dots + 1) % 4;
+          btn.textContent = `${label}${".".repeat(Math.max(1, dots))}`;
+        }, 260);
+        return timer;
+      }
+
+      function stopBusyButton(btn, timer) {
+        if (timer) clearInterval(timer);
+        btn.disabled = false;
+        btn.classList.remove("busy");
+        btn.textContent = btn.dataset.originalLabel || "Spørg";
+      }
+
+      function scanModeLabel(mode) {
+        if (mode === "hand_scanned") return "håndscannet";
+        if (mode === "digital") return "digitaliseret";
+        return String(mode || "ukendt");
       }
 
       function showApp() {
@@ -409,7 +629,7 @@ WEB_UI_HTML = """<!doctype html>
           activeCourseId = Number(c.id);
           document.getElementById("courseTitle").value = c.title || "";
           document.getElementById("courseDesc").value = c.description || "";
-          courseState.innerHTML = `<span class="ok">Active: ${escapeHtml(c.title)}</span> <span class="mono">id=${c.id}</span>`;
+          courseState.innerHTML = `<span class="ok">Aktivt kursus: ${escapeHtml(c.title)}</span> <span class="mono">id=${c.id}</span>`;
         } catch (err) {
           activeCourseId = null;
           if (isNoCourseError(err.message)) {
@@ -448,7 +668,7 @@ WEB_UI_HTML = """<!doctype html>
           chatHistoryEl.innerHTML = items.map((m) => `
             <div class="history-item">
               <div class="history-role">${escapeHtml(m.role)}</div>
-              <div>${escapeHtml(m.content)}</div>
+              <div>${m.role === "assistant" ? markdownToHtml(m.content) : escapeHtml(m.content)}</div>
               <div class="history-time">${escapeHtml(new Date(m.created_at).toLocaleString("da-DK"))}</div>
             </div>
           `).join("");
@@ -481,11 +701,11 @@ WEB_UI_HTML = """<!doctype html>
         try {
           const data = await api("/instances");
           const items = data.instances || [];
-          instancesState.innerHTML = `<span class="ok">${items.length} chatvindue(r)</span>`;
+          instancesState.innerHTML = `<span class="ok">${items.length} chatvinduer</span>`;
           instancesList.innerHTML = items.map((i) => `
             <div class="small">
               <strong>${escapeHtml(i.name)}</strong>
-              <div class="mono">kode=${escapeHtml(i.instance_code)} | chunks=${i.chunk_count} | status=${i.is_active ? "aktiv" : "inaktiv"}</div>
+              <div class="mono">kode=${escapeHtml(i.instance_code)} | tekstuddrag=${i.chunk_count} | status=${i.is_active ? "aktiv" : "inaktiv"}</div>
               <div class="row">
                 <button data-action="copy-invite" data-id="${i.id}" data-code="${escapeHtml(i.instance_code)}">Kopiér link</button>
                 <button data-action="instance-on" data-id="${i.id}">Aktivér</button>
@@ -504,6 +724,24 @@ WEB_UI_HTML = """<!doctype html>
         }
       }
 
+      async function refreshModel() {
+        try {
+          const data = await api("/runtime/model");
+          const select = document.getElementById("chatModelSelect");
+          const models = Array.isArray(data.options) ? data.options : [];
+          select.innerHTML = models.map((m) => `<option value="${escapeHtml(String(m))}">${escapeHtml(String(m))}</option>`).join("");
+          if (!models.length) {
+            select.innerHTML = '<option value="">Ingen modeller fundet</option>';
+          }
+          if (data.active_model) {
+            select.value = data.active_model;
+          }
+          modelState.innerHTML = `<span class="ok">Aktiv model: ${escapeHtml(String(data.active_model || "ukendt"))}</span>`;
+        } catch (err) {
+          modelState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        }
+      }
+
       async function refreshDocuments() {
         try {
           const data = await api("/documents");
@@ -512,7 +750,7 @@ WEB_UI_HTML = """<!doctype html>
           docsList.innerHTML = items.map((d) => `
             <div class="small">
               <strong>${escapeHtml(d.filename)}</strong>
-              <div class="mono">id=${d.id} | mode=${escapeHtml(d.scan_mode || "digital")} | lang=${escapeHtml(d.language || "unknown")} | chunks=${d.chunk_count}</div>
+              <div class="mono">id=${d.id} | tilstand=${escapeHtml(scanModeLabel(d.scan_mode))} | sprog=${escapeHtml(d.language || "ukendt")} | tekstuddrag=${d.chunk_count}</div>
               <div class="row">
                 <button data-action="reingest-digital" data-id="${d.id}">Genindlæs digitalt</button>
                 <button data-action="reingest-scanned" data-id="${d.id}">Genindlæs håndscannet</button>
@@ -623,6 +861,24 @@ WEB_UI_HTML = """<!doctype html>
         document.getElementById("courseTitle").focus();
       });
 
+      document.getElementById("saveModelBtn").addEventListener("click", async () => {
+        try {
+          const model = document.getElementById("chatModelSelect").value.trim();
+          if (!model) {
+            modelState.innerHTML = '<span class="err">Vælg en model først.</span>';
+            return;
+          }
+          const data = await api("/runtime/model", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_model: model }),
+          });
+          modelState.innerHTML = `<span class="ok">Model skiftet til ${escapeHtml(String(data.active_model || model))}</span>`;
+        } catch (err) {
+          modelState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        }
+      });
+
       document.getElementById("publishInstanceBtn").addEventListener("click", async () => {
         try {
           const name = document.getElementById("instanceName").value.trim();
@@ -661,6 +917,7 @@ WEB_UI_HTML = """<!doctype html>
           await refreshActiveCourse();
           await refreshCourses();
           await refreshPrompt();
+          await refreshModel();
           await refreshDocuments();
           await refreshChatHistory();
           await refreshInstances();
@@ -686,10 +943,12 @@ WEB_UI_HTML = """<!doctype html>
       });
 
       document.getElementById("uploadBtn").addEventListener("click", async () => {
+        const uploadBtn = document.getElementById("uploadBtn");
+        const busyTimer = startBusyButton(uploadBtn, "Arbejder");
         try {
           const fileInput = document.getElementById("docFile");
           if (!fileInput.files || !fileInput.files[0]) {
-            ingestState.innerHTML = '<span class="err">Choose file(s) first.</span>';
+            ingestState.innerHTML = '<span class="err">Vælg mindst én fil først.</span>';
             return;
           }
           const uploads = [];
@@ -703,7 +962,7 @@ WEB_UI_HTML = """<!doctype html>
             const data = await api("/upload/document", { method: "POST", body: form });
             uploads.push({ filename: data.filename, job_id: data.job_id, scan_mode: selectedMode, status: "queued" });
           }
-          ingestState.innerHTML = `<span class="ok">${uploads.length} file(s) uploaded. Tracking jobs...</span>`;
+          ingestState.innerHTML = `<span class="ok">${uploads.length} fil(er) uploadet. Følger indlæsning...</span>`;
 
           for (let round = 0; round < 120; round += 1) {
             let done = 0;
@@ -729,30 +988,51 @@ WEB_UI_HTML = """<!doctype html>
           await refreshDocuments();
         } catch (err) {
           ingestState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        } finally {
+          stopBusyButton(uploadBtn, busyTimer);
         }
       });
 
       docsList.addEventListener("click", async (ev) => {
         const target = ev.target;
         if (!(target instanceof HTMLElement)) return;
-        const action = target.getAttribute("data-action");
-        const docId = target.getAttribute("data-id");
+        const button = target.closest("button[data-action]");
+        if (!(button instanceof HTMLElement)) return;
+        const action = button.getAttribute("data-action");
+        const docId = button.getAttribute("data-id");
         if (!action || !docId) return;
         try {
+          let queuedJobId = null;
           if (action === "delete-doc") {
             await api(`/documents/${docId}`, { method: "DELETE" });
           } else if (action === "reingest-digital") {
-            await api(`/documents/${docId}/reingest`, {
+            const queued = await api(`/documents/${docId}/reingest`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ scan_mode: "digital" }),
             });
+            queuedJobId = queued?.job_id ?? null;
           } else if (action === "reingest-scanned") {
-            await api(`/documents/${docId}/reingest`, {
+            const queued = await api(`/documents/${docId}/reingest`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ scan_mode: "hand_scanned" }),
             });
+            queuedJobId = queued?.job_id ?? null;
+          }
+          if (queuedJobId) {
+            docsState.innerHTML = `<span class="ok">Genindlæsning startet (job ${escapeHtml(String(queuedJobId))})...</span>`;
+            for (let round = 0; round < 120; round += 1) {
+              const job = await checkJob(queuedJobId);
+              if (!job) break;
+              const langTag = job.document_language ? ` [sprog: ${job.document_language}]` : "";
+              const chunkTag = job.chunk_count ? ` [chunks: ${job.chunk_count}]` : "";
+              const statusText = `${job.status} (${job.progress}%)${langTag}${chunkTag}${job.error ? ` - ${job.error}` : ""}`;
+              const statusClass = job.status === "failed" ? "err" : "ok";
+              docsState.innerHTML = `<span class="${statusClass}">Job ${escapeHtml(String(queuedJobId))}: ${escapeHtml(statusText)}</span>`;
+              if (job.status === "done" || job.status === "failed") break;
+              await new Promise((r) => setTimeout(r, 1500));
+            }
           }
           await refreshDocuments();
         } catch (err) {
@@ -796,6 +1076,8 @@ WEB_UI_HTML = """<!doctype html>
       });
 
       document.getElementById("chatBtn").addEventListener("click", async () => {
+        const chatBtn = document.getElementById("chatBtn");
+        const busyTimer = startBusyButton(chatBtn, "Arbejder");
         try {
           const message = document.getElementById("question").value.trim();
           const k = Number(document.getElementById("topK").value || 5);
@@ -803,39 +1085,32 @@ WEB_UI_HTML = """<!doctype html>
             chatStatus.innerHTML = '<span class="err">Skriv et spørgsmål.</span>';
             return;
           }
-          chatStatus.textContent = "Tænker...";
-          answerEl.textContent = "";
+          startThinking(chatStatus, "Tænker");
+          answerEl.innerHTML = "";
           sourcesEl.innerHTML = "";
           const data = await api("/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message, k }),
           });
-          chatStatus.innerHTML = `<span class="ok">Færdig</span> <span class="mono">kilder=${data.source_count ?? 0}</span>`;
-          answerEl.textContent = data.answer || "";
-          const maxPreviewChars = 240;
-          (data.contexts || []).forEach((ctx) => {
-            const div = document.createElement("div");
-            div.className = "source small";
-            const fullText = String(ctx.content || "");
-            const shortText = fullText.length > maxPreviewChars ? `${fullText.slice(0, maxPreviewChars)}...` : fullText;
-            div.innerHTML = `
-              <strong>${escapeHtml(ctx.filename)}</strong> p${escapeHtml(ctx.page_start)} idx ${escapeHtml(ctx.chunk_index)}<br>
-              ${escapeHtml(shortText)}
-              <details><summary>Vis hele uddraget</summary>${escapeHtml(fullText)}</details>
-            `;
-            sourcesEl.appendChild(div);
-          });
+          stopThinking(chatStatus);
+          chatStatus.innerHTML = `<span class="ok">Færdig</span> <span class="mono">intent=${escapeHtml(data.intent || "narrow")} | kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0} | runde=${data.retrieval_rounds ?? 1}</span>`;
+          answerEl.innerHTML = markdownToHtml(data.answer || "");
+          renderGroupedSources(sourcesEl, data);
           await refreshChatHistory();
         } catch (err) {
+          stopThinking(chatStatus);
           chatStatus.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        } finally {
+          stopBusyButton(chatBtn, busyTimer);
         }
       });
 
       document.getElementById("newChatBtn").addEventListener("click", async () => {
         try {
+          stopThinking(chatStatus);
           await api("/chat/history", { method: "DELETE" });
-          answerEl.textContent = "";
+          answerEl.innerHTML = "";
           sourcesEl.innerHTML = "";
           chatStatus.innerHTML = '<span class="ok">Ny samtale startet.</span>';
           await refreshChatHistory();
@@ -899,7 +1174,7 @@ STUDENT_UI_HTML = """<!doctype html>
     <div class="wrap">
       <section id="loginCard" class="card">
         <h2>RUCAI Studerende</h2>
-        <div id="studentLoginHint" class="small">Log ind med password fra underviserens invite-link.</div>
+        <div id="studentLoginHint" class="small">Log ind med adgangskode fra underviserens invitationslink.</div>
         <div class="row">
           <input id="instancePassword" type="password" placeholder="adgangskode" />
           <button id="studentLoginBtn">Log ind</button>
@@ -911,7 +1186,7 @@ STUDENT_UI_HTML = """<!doctype html>
         <div class="student-layout">
           <aside class="card student-sidebar">
             <h3 style="margin-top:0;">Materialer</h3>
-            <div class="small">Tekster i denne student-instance.</div>
+            <div class="small">Tekster i dette chatvindue.</div>
             <div id="studentDocs" style="margin-top:10px;"></div>
           </aside>
           <section class="card">
@@ -948,7 +1223,7 @@ STUDENT_UI_HTML = """<!doctype html>
       const pathMatch = window.location.pathname.match(/^\\/student\\/i\\/([^/]+)$/);
       const defaultInstanceCode = pathMatch ? decodeURIComponent(pathMatch[1] || "").toUpperCase() : "";
       if (!defaultInstanceCode) {
-        loginHint.innerHTML = '<span class="err">Åbn via invite-link fra underviser.</span>';
+        loginHint.innerHTML = '<span class="err">Åbn via invitationslink fra underviser.</span>';
       }
 
       function escapeHtml(text) {
@@ -982,6 +1257,21 @@ STUDENT_UI_HTML = """<!doctype html>
         }
         if (inList) out.push("</ul>");
         return out.join("");
+      }
+
+      const thinkingIntervals = new Map();
+
+      function startThinking(el, label = "Tænker") {
+        stopThinking(el);
+        el.innerHTML = `<span class="thinking"><span>${escapeHtml(label)}</span><span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span></span>`;
+      }
+
+      function stopThinking(el) {
+        const timer = thinkingIntervals.get(el);
+        if (timer) {
+          clearInterval(timer);
+          thinkingIntervals.delete(el);
+        }
       }
 
       async function api(path, options = {}) {
@@ -1037,7 +1327,7 @@ STUDENT_UI_HTML = """<!doctype html>
           const instance_code = defaultInstanceCode;
           const password = document.getElementById("instancePassword").value.trim();
           if (!instance_code) {
-            loginState.innerHTML = '<span class="err">Invite-link mangler instance kode.</span>';
+            loginState.innerHTML = '<span class="err">Invitationslink mangler kode.</span>';
             return;
           }
           if (!password) {
@@ -1067,14 +1357,18 @@ STUDENT_UI_HTML = """<!doctype html>
       });
 
       document.getElementById("studentAskBtn").addEventListener("click", async () => {
+        const studentAskBtn = document.getElementById("studentAskBtn");
+        const originalAskLabel = studentAskBtn.textContent || "Spørg";
         try {
+          studentAskBtn.disabled = true;
+          studentAskBtn.textContent = "Arbejder...";
           const message = document.getElementById("studentQuestion").value.trim();
           const k = Number(document.getElementById("studentTopK").value || 5);
           if (!message) {
             studentState.innerHTML = '<span class="err">Skriv et spørgsmål.</span>';
             return;
           }
-          studentState.textContent = "Tænker...";
+          startThinking(studentState, "Tænker");
           answerEl.textContent = "";
           sourcesEl.innerHTML = "";
           const data = await api("/student/chat", {
@@ -1082,16 +1376,16 @@ STUDENT_UI_HTML = """<!doctype html>
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message, k }),
           });
-          studentState.innerHTML = `<span class="ok">Færdig</span>`;
+          stopThinking(studentState);
+          studentState.innerHTML = `<span class="ok">Færdig</span> <span class="mono">kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0}</span>`;
           answerEl.innerHTML = markdownToHtml(data.answer || "");
-          (data.contexts || []).forEach((ctx) => {
-            const div = document.createElement("div");
-            div.className = "source";
-            div.innerHTML = `<strong>${escapeHtml(ctx.filename)}</strong> p${escapeHtml(ctx.page_start)}<br>${escapeHtml(ctx.content || "")}`;
-            sourcesEl.appendChild(div);
-          });
+          renderGroupedSources(sourcesEl, data);
         } catch (err) {
+          stopThinking(studentState);
           studentState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        } finally {
+          studentAskBtn.disabled = false;
+          studentAskBtn.textContent = originalAskLabel;
         }
       });
 
@@ -1148,6 +1442,10 @@ class StudentChatRequest(BaseModel):
     k: int = Field(default=5, ge=1, le=50)
 
 
+class RuntimeModelRequest(BaseModel):
+    chat_model: str = Field(min_length=1, max_length=120)
+
+
 @app.on_event("startup")
 def startup() -> None:
     settings = load_settings()
@@ -1175,6 +1473,44 @@ def student_home_instance(instance_code: str) -> str:
     return STUDENT_UI_HTML
 
 
+def _runtime_model_options(settings: object) -> list[str]:
+    configured = [x.strip() for x in os.getenv("CHAT_MODEL_OPTIONS", "gemma3:12b,qwen2.5:14b-instruct").split(",")]
+    options = [x for x in configured if x]
+    active = str(getattr(settings, "chat_model", "") or "").strip()
+    if active and active not in options:
+        options.insert(0, active)
+    return options
+
+
+@app.get("/runtime/model")
+def get_runtime_model(username: str = Depends(require_auth)) -> dict[str, object]:
+    settings = load_settings()
+    options = _runtime_model_options(settings)
+    return {
+        "active_model": settings.chat_model,
+        "options": options,
+        "scope": "global_runtime",
+    }
+
+
+@app.put("/runtime/model")
+def set_runtime_model(req: RuntimeModelRequest, username: str = Depends(require_auth)) -> dict[str, object]:
+    settings = load_settings()
+    requested = req.chat_model.strip()
+    options = _runtime_model_options(settings)
+    if requested not in options:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Model '{requested}' er ikke tilladt. Tilladte modeller: {', '.join(options)}",
+        )
+    os.environ["CHAT_MODEL"] = requested
+    return {
+        "active_model": requested,
+        "options": options,
+        "scope": "global_runtime",
+    }
+
+
 @app.post("/auth/login")
 def login(req: LoginRequest) -> dict[str, str]:
     settings = load_settings()
@@ -1193,7 +1529,11 @@ def publish_instance(req: InstanceCreateRequest, username: str = Depends(require
 
     with get_connection(settings) as conn:
         editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
-        effective_prompt = compose_system_prompt(editable)
+        effective_prompt = compose_system_prompt(
+            editable,
+            course_title=str(course.get("title") or ""),
+            course_description=str(course.get("description") or ""),
+        )
         chosen_code = code
         created = None
         for _ in range(5):
@@ -1318,34 +1658,39 @@ def student_chat(req: StudentChatRequest, instance_id: int = Depends(require_stu
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
 
     contexts = search_instance_chunks(req.message, settings, req.k, instance_id)
+    sources = build_grouped_sources(contexts, max_snippets_per_source=1)
     system_prompt = str(instance["effective_system_prompt_snapshot"])
     if not contexts:
         answer = (
             "Jeg kan ikke svare fagligt sikkert ud fra det publicerede materiale. "
             "Prøv at omformulere spørgsmålet."
         )
-        prompt = _build_student_prompt(req.message, contexts, system_prompt)
+        prompt = _build_student_prompt(req.message, sources, system_prompt)
     else:
-        prompt = _build_student_prompt(req.message, contexts, system_prompt)
+        prompt = _build_student_prompt(req.message, sources, system_prompt)
         answer = generate_answer(prompt, settings)
 
-    citations = [
-        {
-            "ref": idx,
-            "filename": ctx["filename"],
-            "page_start": ctx.get("page_start"),
-            "chunk_index": ctx.get("chunk_index"),
-        }
-        for idx, ctx in enumerate(contexts, start=1)
-    ]
+    citations = []
+    for source in sources:
+        first_snippet = (source.get("snippets") or [{}])[0]
+        citations.append(
+            {
+                "ref": source.get("ref"),
+                "filename": source.get("filename"),
+                "page_start": first_snippet.get("page_start"),
+                "chunk_index": first_snippet.get("chunk_index"),
+            }
+        )
     return {
         "instance_id": instance_id,
         "query": req.message,
         "k": req.k,
         "answer": answer,
         "contexts": contexts,
+        "sources": sources,
         "citations": citations,
-        "source_count": len(contexts),
+        "source_count": len(sources),
+        "chunk_count": len(contexts),
         "prompt": prompt,
     }
 
@@ -1404,7 +1749,11 @@ def read_course_prompt(username: str = Depends(require_auth)) -> dict[str, str]:
     return {
         "editable_instructions": editable,
         "locked_safety_block": LOCKED_SAFETY_BLOCK,
-        "effective_prompt_preview": compose_system_prompt(editable),
+        "effective_prompt_preview": compose_system_prompt(
+            editable,
+            course_title=str(course.get("title") or ""),
+            course_description=str(course.get("description") or ""),
+        ),
     }
 
 
@@ -1419,7 +1768,11 @@ def update_course_prompt(req: PromptRequest, username: str = Depends(require_aut
     return {
         "editable_instructions": req.editable_instructions,
         "locked_safety_block": LOCKED_SAFETY_BLOCK,
-        "effective_prompt_preview": compose_system_prompt(req.editable_instructions),
+        "effective_prompt_preview": compose_system_prompt(
+            req.editable_instructions,
+            course_title=str(course.get("title") or ""),
+            course_description=str(course.get("description") or ""),
+        ),
     }
 
 
@@ -1523,10 +1876,12 @@ def _generate_instance_code(length: int = 8) -> str:
     return "".join(choice(INSTANCE_CODE_ALPHABET) for _ in range(length))
 
 
-def _build_student_prompt(query: str, contexts: List[dict[str, object]], system_prompt: str) -> str:
+def _build_student_prompt(query: str, sources: List[dict[str, object]], system_prompt: str) -> str:
     blocks: List[str] = []
-    for idx, ctx in enumerate(contexts, start=1):
-        blocks.append(f"[{idx}] {ctx['filename']} p{ctx.get('page_start')}\n{ctx['content']}")
+    for source in sources:
+        ref = int(source.get("ref") or 0)
+        for snippet in source.get("snippets") or []:
+            blocks.append(f"[{ref}] {snippet.get('filename')} p{snippet.get('page_start')}\n{snippet.get('content')}")
     context_text = "\n\n".join(blocks)
     return (
         system_prompt
@@ -1534,7 +1889,7 @@ def _build_student_prompt(query: str, contexts: List[dict[str, object]], system_
         + context_text
         + "\n\nBRUGERSPØRGSMÅL:\n"
         + query
-        + "\n\nSkriv et svar med tydelige kildehenvisninger [1], [2]."
+        + "\n\nSkriv et svar med tydelige kildehenvisninger [1], [2]. Hvis flere tekstuddrag kommer fra samme dokument, brug samme [n]."
     )
 
 
@@ -1733,6 +2088,8 @@ def chat(req: ChatRequest, username: str = Depends(require_auth)) -> dict[str, o
             req.k,
             course_id,
             editable_instructions=editable,
+            course_title=str(course.get("title") or ""),
+            course_description=str(course.get("description") or ""),
             history=history,
         )
     except TypeError:

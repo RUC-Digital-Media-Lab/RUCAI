@@ -1,0 +1,22 @@
+[Unit]
+Description=RUCAI FastAPI service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ucloud
+Group=ucloud
+WorkingDirectory=/home/ucloud/RUCAI
+EnvironmentFile=/home/ucloud/RUCAI/.env
+ExecStart=/home/ucloud/RUCAI/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8011
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+# Keep logs in journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

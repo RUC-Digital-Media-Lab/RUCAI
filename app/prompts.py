@@ -25,6 +25,17 @@ DEFAULT_EDITABLE_INSTRUCTIONS = """Undervisningskontekst:
 """
 
 
-def compose_system_prompt(editable_instructions: str) -> str:
+def compose_system_prompt(
+    editable_instructions: str,
+    course_title: str = "",
+    course_description: str = "",
+) -> str:
     editable = (editable_instructions or "").strip() or DEFAULT_EDITABLE_INSTRUCTIONS
-    return f"{BASE_SYSTEM_PROMPT}\n\n{editable}\n\n{LOCKED_SAFETY_BLOCK}"
+    title = (course_title or "").strip() or "(ikke angivet)"
+    description = (course_description or "").strip() or "(ikke angivet)"
+    course_context = (
+        "Kursuskontekst:\n"
+        f"- Titel: {title}\n"
+        f"- Kursusbeskrivelse: {description}"
+    )
+    return f"{BASE_SYSTEM_PROMPT}\n\n{course_context}\n\n{editable}\n\n{LOCKED_SAFETY_BLOCK}"

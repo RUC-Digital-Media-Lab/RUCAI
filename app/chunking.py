@@ -23,7 +23,10 @@ def chunk_text(text: str, max_words: int, overlap: int) -> List[str]:
 
 
 def normalize_text(text: str) -> str:
-    return " ".join(text.split())
+    # PostgreSQL text fields cannot contain NUL bytes.
+    # Strip them early so all ingest paths are safe.
+    sanitized = text.replace("\x00", " ")
+    return " ".join(sanitized.split())
 
 
 def iter_nonempty(chunks: Iterable[str]) -> Iterable[str]:
