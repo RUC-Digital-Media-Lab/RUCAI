@@ -213,14 +213,14 @@ WEB_UI_HTML = """<!doctype html>
       <section class="card" id="activeCourseCard">
         <h3>Information om kursus</h3>
         <div class="row">
-          <input id="courseTitle" type="text" placeholder="Course title" />
+          <input id="courseTitle" type="text" placeholder="Kursustitel" />
         </div>
         <div class="row">
-          <textarea id="courseDesc" placeholder="Course description"></textarea>
+          <textarea id="courseDesc" placeholder="Kursusbeskrivelse"></textarea>
         </div>
         <div class="row">
           <button id="setCourseBtn" class="primary">Placer kursusbeskrivelse og titel i systemprompt</button>
-          <button id="refreshCourseBtn">Refresh</button>
+          <button id="refreshCourseBtn">Opdater</button>
         </div>
         <div id="courseState" class="small"></div>
       </section>
@@ -229,43 +229,43 @@ WEB_UI_HTML = """<!doctype html>
         <h3>Kursusprompt</h3>
         <div class="small">Du kan redigere undervisningsinstruktionen. Nogle grundregler er faste for at sikre kildebaserede og ansvarlige svar.</div>
         <div class="row">
-          <textarea id="promptEditable" placeholder="Editable course instructions"></textarea>
+          <textarea id="promptEditable" placeholder="Redigerbar kursusinstruktion"></textarea>
         </div>
         <div class="row">
-          <button id="savePromptBtn" class="primary">Save Prompt</button>
-          <button id="refreshPromptBtn">Refresh Prompt</button>
+          <button id="savePromptBtn" class="primary">Gem kursusprompt</button>
+          <button id="refreshPromptBtn">Opdater kursusprompt</button>
         </div>
         <details class="small">
           <summary>Faste grundregler (kan ikke redigeres)</summary>
           <pre id="promptLocked"></pre>
         </details>
         <details class="small">
-          <summary>Effective prompt preview</summary>
+          <summary>Aktiv prompt (preview)</summary>
           <pre id="promptPreview"></pre>
         </details>
         <div id="promptState" class="small"></div>
       </section>
 
       <section class="card">
-        <h3>Student Instances</h3>
+        <h3>Studenter-chatvinduer</h3>
         <div class="small">Publicér en låst chatbot til studerende ud fra aktivt kursus.</div>
         <div class="row">
-          <input id="instanceName" type="text" placeholder="Instance navn (fx Hold A Foraar 2026)" />
+          <input id="instanceName" type="text" placeholder="Navn på chatvindue (fx Hold A Forår 2026)" />
         </div>
         <div class="row">
-          <input id="instanceCode" type="text" placeholder="Instance kode (valgfri, auto hvis tom)" />
-          <input id="instancePassword" type="password" placeholder="Instance password" />
+          <input id="instanceCode" type="text" placeholder="Kode (valgfri, autogenereres hvis tom)" />
+          <input id="instancePassword" type="password" placeholder="Adgangskode til studerende" />
           <button id="publishInstanceBtn" class="primary">Publish</button>
-          <button id="refreshInstancesBtn">Refresh</button>
+          <button id="refreshInstancesBtn">Opdater</button>
         </div>
         <div id="instancesState" class="small"></div>
         <div id="instancesList" class="stack"></div>
       </section>
 
       <section class="card">
-        <h3>Documents</h3>
+        <h3>Dokumenter</h3>
         <div class="row">
-          <button id="refreshDocsBtn">Refresh Documents</button>
+          <button id="refreshDocsBtn">Opdater dokumenter</button>
         </div>
         <div id="docsState" class="small"></div>
         <div id="docsList" class="stack"></div>
@@ -275,7 +275,7 @@ WEB_UI_HTML = """<!doctype html>
         <h3>Upload PDF/DOCX</h3>
         <div class="row">
           <input id="docFile" type="file" multiple accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
-          <button id="uploadBtn" class="primary">Upload + Ingest</button>
+          <button id="uploadBtn" class="primary">Upload og indlæs</button>
         </div>
         <div id="scanModeList" class="small"></div>
         <div id="ingestState" class="small"></div>
@@ -286,7 +286,7 @@ WEB_UI_HTML = """<!doctype html>
         <div class="row">
           <label for="topK" class="small">Kilder pr. svar (k)</label>
           <input id="topK" type="number" min="1" max="50" value="5" />
-          <button id="chatBtn" class="primary">Ask</button>
+          <button id="chatBtn" class="primary">Spørg</button>
           <button id="newChatBtn" class="warn">Ny samtale</button>
         </div>
         <div id="chatStatus" class="small"></div>
@@ -457,7 +457,7 @@ WEB_UI_HTML = """<!doctype html>
           promptEditableEl.value = data.editable_instructions || "";
           promptLockedEl.textContent = data.locked_safety_block || "";
           promptPreviewEl.textContent = data.effective_prompt_preview || "";
-          promptState.innerHTML = '<span class="ok">Prompt loaded</span>';
+          promptState.innerHTML = '<span class="ok">Kursusprompt hentet</span>';
         } catch (err) {
           if (isNoCourseError(err.message)) {
             promptState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at redigere course prompt.</span>';
@@ -471,15 +471,15 @@ WEB_UI_HTML = """<!doctype html>
         try {
           const data = await api("/instances");
           const items = data.instances || [];
-          instancesState.innerHTML = `<span class="ok">${items.length} instances</span>`;
+          instancesState.innerHTML = `<span class="ok">${items.length} chatvindue(r)</span>`;
           instancesList.innerHTML = items.map((i) => `
             <div class="small">
               <strong>${escapeHtml(i.name)}</strong>
-              <div class="mono">code=${escapeHtml(i.instance_code)} | chunks=${i.chunk_count} | status=${i.is_active ? "active" : "inactive"}</div>
+              <div class="mono">kode=${escapeHtml(i.instance_code)} | chunks=${i.chunk_count} | status=${i.is_active ? "aktiv" : "inaktiv"}</div>
               <div class="row">
-                <button data-action="copy-invite" data-id="${i.id}" data-code="${escapeHtml(i.instance_code)}">Copy Invite</button>
-                <button data-action="instance-on" data-id="${i.id}">Activate</button>
-                <button data-action="instance-off" data-id="${i.id}" class="warn">Deactivate</button>
+                <button data-action="copy-invite" data-id="${i.id}" data-code="${escapeHtml(i.instance_code)}">Kopiér link</button>
+                <button data-action="instance-on" data-id="${i.id}">Aktivér</button>
+                <button data-action="instance-off" data-id="${i.id}" class="warn">Deaktivér</button>
               </div>
             </div>
           `).join("");
@@ -498,15 +498,15 @@ WEB_UI_HTML = """<!doctype html>
         try {
           const data = await api("/documents");
           const items = data.documents || [];
-          docsState.innerHTML = `<span class="ok">${items.length} document(s)</span>`;
+          docsState.innerHTML = `<span class="ok">${items.length} dokument(er)</span>`;
           docsList.innerHTML = items.map((d) => `
             <div class="small">
               <strong>${escapeHtml(d.filename)}</strong>
               <div class="mono">id=${d.id} | mode=${escapeHtml(d.scan_mode || "digital")} | lang=${escapeHtml(d.language || "unknown")} | chunks=${d.chunk_count}</div>
               <div class="row">
-                <button data-action="reingest-digital" data-id="${d.id}">Reingest Digital</button>
-                <button data-action="reingest-scanned" data-id="${d.id}">Reingest Håndscannet</button>
-                <button data-action="delete-doc" data-id="${d.id}" class="warn">Delete</button>
+                <button data-action="reingest-digital" data-id="${d.id}">Genindlæs digitalt</button>
+                <button data-action="reingest-scanned" data-id="${d.id}">Genindlæs håndscannet</button>
+                <button data-action="delete-doc" data-id="${d.id}" class="warn">Slet</button>
               </div>
             </div>
           `).join("");
@@ -619,7 +619,7 @@ WEB_UI_HTML = """<!doctype html>
           const instance_code = document.getElementById("instanceCode").value.trim();
           const instance_password = document.getElementById("instancePassword").value.trim();
           if (!name || !instance_password) {
-            instancesState.innerHTML = '<span class="err">Name og password er påkrævet.</span>';
+            instancesState.innerHTML = '<span class="err">Navn og adgangskode er påkrævet.</span>';
             return;
           }
           const created = await api("/instances", {
@@ -632,7 +632,7 @@ WEB_UI_HTML = """<!doctype html>
           await copyToClipboard(studentUrl);
           document.getElementById("instanceCode").value = "";
           document.getElementById("instancePassword").value = "";
-          instancesState.innerHTML = '<span class="ok">Instance publiceret. Invite kopieret.</span>';
+          instancesState.innerHTML = '<span class="ok">Chatvindue publiceret. Link kopieret.</span>';
           await refreshInstances();
         } catch (err) {
           instancesState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -669,7 +669,7 @@ WEB_UI_HTML = """<!doctype html>
           });
           promptLockedEl.textContent = data.locked_safety_block || "";
           promptPreviewEl.textContent = data.effective_prompt_preview || "";
-          promptState.innerHTML = '<span class="ok">Prompt saved</span>';
+          promptState.innerHTML = '<span class="ok">Kursusprompt gemt</span>';
         } catch (err) {
           promptState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
         }
@@ -790,10 +790,10 @@ WEB_UI_HTML = """<!doctype html>
           const message = document.getElementById("question").value.trim();
           const k = Number(document.getElementById("topK").value || 5);
           if (!message) {
-            chatStatus.innerHTML = '<span class="err">Enter a question.</span>';
+            chatStatus.innerHTML = '<span class="err">Skriv et spørgsmål.</span>';
             return;
           }
-          chatStatus.textContent = "Thinking...";
+          chatStatus.textContent = "Tænker...";
           answerEl.textContent = "";
           sourcesEl.innerHTML = "";
           const data = await api("/chat", {
@@ -801,7 +801,7 @@ WEB_UI_HTML = """<!doctype html>
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message, k }),
           });
-          chatStatus.innerHTML = `<span class="ok">Done</span> <span class="mono">kilder=${data.source_count ?? 0}</span>`;
+          chatStatus.innerHTML = `<span class="ok">Færdig</span> <span class="mono">kilder=${data.source_count ?? 0}</span>`;
           answerEl.textContent = data.answer || "";
           const maxPreviewChars = 240;
           (data.contexts || []).forEach((ctx) => {
@@ -858,7 +858,7 @@ STUDENT_UI_HTML = """<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RUCAI Student</title>
+    <title>RUCAI Studerende</title>
     <style>
       body { margin: 0; font-family: "Avenir Next", "IBM Plex Sans", sans-serif; background: #f7f5f0; color: #1f1f1d; }
       .wrap { width: min(1200px, 96vw); margin: 24px auto; }
@@ -888,10 +888,10 @@ STUDENT_UI_HTML = """<!doctype html>
   <body>
     <div class="wrap">
       <section id="loginCard" class="card">
-        <h2>RUCAI Student</h2>
+        <h2>RUCAI Studerende</h2>
         <div id="studentLoginHint" class="small">Log ind med password fra underviserens invite-link.</div>
         <div class="row">
-          <input id="instancePassword" type="password" placeholder="password" />
+          <input id="instancePassword" type="password" placeholder="adgangskode" />
           <button id="studentLoginBtn">Log ind</button>
         </div>
         <div id="loginState" class="small"></div>
@@ -906,7 +906,7 @@ STUDENT_UI_HTML = """<!doctype html>
           </aside>
           <section class="card">
             <div class="row">
-              <h3 id="instanceTitle" style="margin:0;">Instance</h3>
+              <h3 id="instanceTitle" style="margin:0;">Chatvindue</h3>
               <button id="studentLogoutBtn" class="warn">Log ud</button>
             </div>
             <div class="row">
@@ -990,7 +990,7 @@ STUDENT_UI_HTML = """<!doctype html>
       async function refreshStudentMeta() {
         try {
           const data = await api("/student/instance");
-          instanceTitle.textContent = data.instance.name || "Instance";
+          instanceTitle.textContent = data.instance.name || "Chatvindue";
           await refreshStudentDocuments();
           loginCard.classList.add("hidden");
           studentCard.classList.remove("hidden");
