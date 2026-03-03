@@ -102,8 +102,8 @@ if [[ "$SYNC_DB" == "1" ]]; then
     dst_pw_prefix="PGPASSWORD='$(escape_sq "$UCLOUD_DB_PASSWORD")' "
   fi
 
-  src_cmd="${src_pw_prefix}pg_dump -Fc -h '$(escape_sq "$SERVER_DB_HOST")' -p '$(escape_sq "$SERVER_DB_PORT")' -U '$(escape_sq "$SERVER_DB_USER")' '$(escape_sq "$SERVER_DB_NAME")'"
-  dst_cmd="${dst_pw_prefix}pg_restore --clean --if-exists -h '$(escape_sq "$UCLOUD_DB_HOST")' -p '$(escape_sq "$UCLOUD_DB_PORT")' -U '$(escape_sq "$UCLOUD_DB_USER")' -d '$(escape_sq "$UCLOUD_DB_NAME")'"
+  src_cmd="${src_pw_prefix}pg_dump -w -Fc -h '$(escape_sq "$SERVER_DB_HOST")' -p '$(escape_sq "$SERVER_DB_PORT")' -U '$(escape_sq "$SERVER_DB_USER")' '$(escape_sq "$SERVER_DB_NAME")'"
+  dst_cmd="${dst_pw_prefix}pg_restore --exit-on-error --clean --if-exists -h '$(escape_sq "$UCLOUD_DB_HOST")' -p '$(escape_sq "$UCLOUD_DB_PORT")' -U '$(escape_sq "$UCLOUD_DB_USER")' -d '$(escape_sq "$UCLOUD_DB_NAME")'"
 
   set +e
   ssh "${ssh_opts[@]}" "$SERVER_SSH" "$src_cmd" | bash -lc "$dst_cmd"
@@ -113,7 +113,7 @@ if [[ "$SYNC_DB" == "1" ]]; then
   if [[ "$rc" -ne 0 ]]; then
     if [[ "$USE_DEST_SUDO_RESTORE_FALLBACK" == "1" ]]; then
       echo "Primary DB sync failed. Retrying destination restore via sudo -u postgres..."
-      sudo_dst_cmd="sudo -n -u postgres pg_restore --clean --if-exists -d '$(escape_sq "$UCLOUD_DB_NAME")'"
+      sudo_dst_cmd="sudo -n -u postgres pg_restore --exit-on-error --clean --if-exists -d '$(escape_sq "$UCLOUD_DB_NAME")'"
       ssh "${ssh_opts[@]}" "$SERVER_SSH" "$src_cmd" | bash -lc "$sudo_dst_cmd"
     else
       echo "DB sync failed and fallback disabled (USE_DEST_SUDO_RESTORE_FALLBACK=0)."
