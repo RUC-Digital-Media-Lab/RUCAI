@@ -1,0 +1,8 @@
+# Local/private project files
+AGENTS.md
+rucai_participants.xlsx
+
+# Common local noise
+.DS_Store
+__pycache__/
+*.pyc
