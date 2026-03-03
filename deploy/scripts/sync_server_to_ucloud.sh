@@ -30,6 +30,7 @@ set -euo pipefail
 #   SYNC_CODE             default: 1
 #   SYNC_UPLOADS          default: 1
 #   SYNC_DB               default: 1
+#   USE_DEST_SUDO_RESTORE_FALLBACK default: 1
 
 : "${SERVER_SSH:?Set SERVER_SSH, e.g. frede@212.27.13.34}"
 : "${SERVER_SSH_PORT:?Set SERVER_SSH_PORT, e.g. 2111}"
@@ -51,6 +52,7 @@ UCLOUD_DB_USER="${UCLOUD_DB_USER:-ppl}"
 SYNC_CODE="${SYNC_CODE:-1}"
 SYNC_UPLOADS="${SYNC_UPLOADS:-1}"
 SYNC_DB="${SYNC_DB:-1}"
+USE_DEST_SUDO_RESTORE_FALLBACK="${USE_DEST_SUDO_RESTORE_FALLBACK:-1}"
 
 ssh_opts=("-p" "$SERVER_SSH_PORT" "-o" "StrictHostKeyChecking=accept-new")
 rsync_ssh="ssh ${ssh_opts[*]}"
@@ -100,9 +102,24 @@ if [[ "$SYNC_DB" == "1" ]]; then
     dst_pw_prefix="PGPASSWORD='$(escape_sq "$UCLOUD_DB_PASSWORD")' "
   fi
 
-  ssh "${ssh_opts[@]}" "$SERVER_SSH" \
-    "${src_pw_prefix}pg_dump -Fc -h '$(escape_sq "$SERVER_DB_HOST")' -p '$(escape_sq "$SERVER_DB_PORT")' -U '$(escape_sq "$SERVER_DB_USER")' '$(escape_sq "$SERVER_DB_NAME")'" \
-    | bash -lc "${dst_pw_prefix}pg_restore --clean --if-exists -h '$(escape_sq "$UCLOUD_DB_HOST")' -p '$(escape_sq "$UCLOUD_DB_PORT")' -U '$(escape_sq "$UCLOUD_DB_USER")' -d '$(escape_sq "$UCLOUD_DB_NAME")'"
+  src_cmd="${src_pw_prefix}pg_dump -Fc -h '$(escape_sq "$SERVER_DB_HOST")' -p '$(escape_sq "$SERVER_DB_PORT")' -U '$(escape_sq "$SERVER_DB_USER")' '$(escape_sq "$SERVER_DB_NAME")'"
+  dst_cmd="${dst_pw_prefix}pg_restore --clean --if-exists -h '$(escape_sq "$UCLOUD_DB_HOST")' -p '$(escape_sq "$UCLOUD_DB_PORT")' -U '$(escape_sq "$UCLOUD_DB_USER")' -d '$(escape_sq "$UCLOUD_DB_NAME")'"
+
+  set +e
+  ssh "${ssh_opts[@]}" "$SERVER_SSH" "$src_cmd" | bash -lc "$dst_cmd"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ "$USE_DEST_SUDO_RESTORE_FALLBACK" == "1" ]]; then
+      echo "Primary DB sync failed. Retrying destination restore via sudo -u postgres..."
+      sudo_dst_cmd="sudo -n -u postgres pg_restore --clean --if-exists -d '$(escape_sq "$UCLOUD_DB_NAME")'"
+      ssh "${ssh_opts[@]}" "$SERVER_SSH" "$src_cmd" | bash -lc "$sudo_dst_cmd"
+    else
+      echo "DB sync failed and fallback disabled (USE_DEST_SUDO_RESTORE_FALLBACK=0)."
+      exit 1
+    fi
+  fi
 else
   echo "[3/3] Skip DB sync (SYNC_DB=0)"
 fi

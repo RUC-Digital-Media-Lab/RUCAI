@@ -36,6 +36,19 @@ cd "$APP_DIR"
 echo "[cutover_to_ucloud] app_dir=$APP_DIR"
 echo "[cutover_to_ucloud] ucloud=${UCLOUD_SSH}:${UCLOUD_SSH_PORT} app_dir=${UCLOUD_APP_DIR}"
 
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
+
+# Default source DB params from local server app env when not explicitly provided.
+SERVER_DB_HOST="${SERVER_DB_HOST:-${DB_HOST:-localhost}}"
+SERVER_DB_PORT="${SERVER_DB_PORT:-${DB_PORT:-5432}}"
+SERVER_DB_NAME="${SERVER_DB_NAME:-${DB_NAME:-ppl_rag}}"
+SERVER_DB_USER="${SERVER_DB_USER:-${DB_USER:-ppl}}"
+SERVER_DB_PASSWORD="${SERVER_DB_PASSWORD:-${DB_PASSWORD:-}}"
+
 if [[ "$MAINTENANCE_WINDOW" == "1" ]]; then
   echo "[prep] Enable maintenance window"
   ACTION=install_hook bash deploy/scripts/maintenance_banner.sh
@@ -45,6 +58,7 @@ fi
 
 if [[ "$RUN_SYNC" == "1" ]]; then
   echo "[1/4] Sync server -> ucloud"
+  esc_server_db_password="$(printf %q "${SERVER_DB_PASSWORD}")"
   ssh -p "$UCLOUD_SSH_PORT" "$UCLOUD_SSH" "
     set -e
     cd '$UCLOUD_APP_DIR'
@@ -52,6 +66,11 @@ if [[ "$RUN_SYNC" == "1" ]]; then
     export SERVER_SSH_PORT='${SERVER_SSH_PORT:-2111}'
     export SERVER_APP_DIR='${SERVER_APP_DIR:-/home/frede/RUCAI}'
     export SERVER_UPLOAD_ROOT='${SERVER_UPLOAD_ROOT:-/home/frede/RUCAI/data/uploads}'
+    export SERVER_DB_HOST='${SERVER_DB_HOST}'
+    export SERVER_DB_PORT='${SERVER_DB_PORT}'
+    export SERVER_DB_NAME='${SERVER_DB_NAME}'
+    export SERVER_DB_USER='${SERVER_DB_USER}'
+    export SERVER_DB_PASSWORD=${esc_server_db_password}
     export UCLOUD_APP_DIR='${UCLOUD_APP_DIR}'
     export UCLOUD_UPLOAD_ROOT='${UCLOUD_UPLOAD_ROOT:-$UCLOUD_APP_DIR/data/uploads}'
     bash deploy/scripts/sync_server_to_ucloud.sh

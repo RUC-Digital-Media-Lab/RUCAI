@@ -27,6 +27,19 @@ cd "$APP_DIR"
 
 echo "[cutover_to_server] app_dir=$APP_DIR"
 
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
+
+# Default destination DB params from local app env when not explicitly provided.
+export SERVER_DB_HOST="${SERVER_DB_HOST:-${DB_HOST:-localhost}}"
+export SERVER_DB_PORT="${SERVER_DB_PORT:-${DB_PORT:-5432}}"
+export SERVER_DB_NAME="${SERVER_DB_NAME:-${DB_NAME:-ppl_rag}}"
+export SERVER_DB_USER="${SERVER_DB_USER:-${DB_USER:-ppl}}"
+export SERVER_DB_PASSWORD="${SERVER_DB_PASSWORD:-${DB_PASSWORD:-}}"
+
 if [[ "$MAINTENANCE_WINDOW" == "1" ]]; then
   echo "[prep] Enable maintenance window"
   ACTION=install_hook bash deploy/scripts/maintenance_banner.sh
