@@ -100,12 +100,19 @@ fi
 echo "[4/4] Health checks"
 curl -fsS -m 8 http://127.0.0.1:18011/health && echo
 if [[ "$RUN_DOMAIN_CHECK" == "1" ]]; then
-  curl -fsS -m 12 "$DOMAIN_HEALTH_URL" && echo
+  if [[ "$MAINTENANCE_WINDOW" == "1" ]]; then
+    echo "Domain check deferred until maintenance is disabled."
+  else
+    curl -fsS -m 12 "$DOMAIN_HEALTH_URL" && echo
+  fi
 fi
 
 if [[ "$MAINTENANCE_WINDOW" == "1" ]]; then
   ACTION=disable bash deploy/scripts/maintenance_banner.sh
   trap - EXIT
+  if [[ "$RUN_DOMAIN_CHECK" == "1" ]]; then
+    curl -fsS -m 12 "$DOMAIN_HEALTH_URL" && echo
+  fi
 fi
 
 echo "Cutover-to-ucloud completed."
