@@ -203,6 +203,23 @@ def ensure_schema(settings: Settings) -> None:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS student_chat_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    instance_id BIGINT NOT NULL REFERENCES bot_instances(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_student_chat_messages_instance_id
+                ON student_chat_messages(instance_id);
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS bot_instance_chunks (
                     id BIGSERIAL PRIMARY KEY,
                     instance_id BIGINT NOT NULL REFERENCES bot_instances(id) ON DELETE CASCADE,
@@ -768,6 +785,47 @@ def delete_chat_messages_for_course(conn: psycopg.Connection, course_id: int) ->
         )
         rows = cur.fetchall()
     return len(rows)
+
+
+def insert_student_chat_message(conn: psycopg.Connection, instance_id: int, role: str, content: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO student_chat_messages (instance_id, role, content)
+            VALUES (%s, %s, %s);
+            """,
+            (instance_id, role, content),
+        )
+
+
+def list_student_chat_messages_for_instance(
+    conn: psycopg.Connection,
+    instance_id: int,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    capped_limit = max(1, min(limit, 500))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, role, content, created_at
+            FROM student_chat_messages
+            WHERE instance_id = %s
+            ORDER BY created_at ASC
+            LIMIT %s;
+            """,
+            (instance_id, capped_limit),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "role": row[1],
+            "content": row[2],
+            "created_at": row[3].isoformat() if isinstance(row[3], datetime) else row[3],
+        }
+        for row in rows
+    ]
 
 
 def create_bot_instance(

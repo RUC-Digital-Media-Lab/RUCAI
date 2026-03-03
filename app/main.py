@@ -10,6 +10,7 @@ from threading import Thread
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .auth import (
@@ -45,17 +46,27 @@ from .db import (
     get_ingest_job,
     insert_chat_message,
     list_chat_messages_for_course,
+    list_student_chat_messages_for_instance,
     list_documents_for_course,
     set_active_course_by_id,
     set_bot_instance_status,
+    insert_student_chat_message,
     upsert_course_prompt,
 )
 from .ingest import process_ingest_job
 from .llm import generate_answer
-from .prompts import DEFAULT_EDITABLE_INSTRUCTIONS, LOCKED_SAFETY_BLOCK, compose_system_prompt
+from .prompts import (
+    DEFAULT_EDITABLE_INSTRUCTIONS,
+    LOCKED_SAFETY_BLOCK,
+    compose_system_prompt,
+    to_student_editable_instructions,
+)
 from .search import search_chunks, search_instance_chunks
 
 app = FastAPI(title="RUCAI")
+LOGO_DIR = Path(__file__).resolve().parent.parent / "logo"
+if LOGO_DIR.exists():
+    app.mount("/logo", StaticFiles(directory=str(LOGO_DIR)), name="logo")
 
 INSTANCE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -115,6 +126,8 @@ WEB_UI_HTML = """<!doctype html>
       .header { padding: 0.2rem; }
       .header { position: relative; }
       .header h1 { margin: 0; font-family: "Iowan Old Style", "Palatino Linotype", serif; letter-spacing: 0.02em; }
+      .brand-logo { display: block; height: 156px; width: auto; object-fit: contain; max-width: min(70vw, 720px); }
+      .gate-logo { display: block; margin: 4px auto 10px; height: 96px; width: auto; max-width: 90%; object-fit: contain; }
       .header p { margin: 0.35rem 0 0; color: var(--muted); }
       .header-actions { position: absolute; right: 0; top: 0; }
       @media (max-width: 960px) {
@@ -126,7 +139,15 @@ WEB_UI_HTML = """<!doctype html>
         backdrop-filter: blur(6px);
         border-radius: 14px;
         padding: 14px;
+        overflow: hidden;
         box-shadow: 0 12px 26px rgba(16, 22, 19, 0.07);
+      }
+      pre {
+        max-width: 100%;
+        overflow-x: auto;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
       }
       .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
       textarea, input[type="text"], input[type="password"], input[type="number"], select {
@@ -248,6 +269,7 @@ WEB_UI_HTML = """<!doctype html>
 
     <div id="loginGate" class="gate-wrap">
       <section class="gate-card">
+        <img class="gate-logo" src="/logo/RUCAI_LOGO_new.png" alt="RUCAI" />
         <h2 class="gate-title">RUCAI Log ind</h2>
         <p class="gate-sub">Log ind for at åbne platformen.</p>
         <div class="row">
@@ -263,13 +285,8 @@ WEB_UI_HTML = """<!doctype html>
       <header class="header">
         <h1>RUCAI</h1>
         <div class="header-actions">
-          <select id="chatModelSelect" style="min-width:220px;">
-            <option value="">Vælg model…</option>
-          </select>
-          <button id="saveModelBtn">Gem model</button>
           <button id="logoutTopBtn" class="warn">Log ud</button>
         </div>
-        <div id="modelState" class="small"></div>
       </header>
 
       <section class="card">
@@ -330,6 +347,14 @@ WEB_UI_HTML = """<!doctype html>
           <summary>Aktiv prompt (preview)</summary>
           <pre id="promptPreview"></pre>
         </details>
+        <details class="small">
+          <summary>Underviser-prompt (aktiv)</summary>
+          <pre id="promptTeacherPreview"></pre>
+        </details>
+        <details class="small">
+          <summary>Studenter-prompt (ved publicering)</summary>
+          <pre id="promptStudentPreview"></pre>
+        </details>
         <div id="promptState" class="small"></div>
       </section>
 
@@ -360,6 +385,15 @@ WEB_UI_HTML = """<!doctype html>
           <label for="topK" class="small">Kilder pr. svar (k)</label>
           <input id="topK" type="number" min="1" max="50" value="5" />
         </div>
+        <div class="row">
+          <label for="chatModelSelect" class="small">Model</label>
+          <select id="chatModelSelect" style="min-width:240px;">
+            <option value="gemma3:12b" selected>gemma3:12b (12.2B, 131,072 kontekst, hurtig)</option>
+            <option value="mistral-nemo">mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)</option>
+          </select>
+          <button id="saveModelBtn">Gem model</button>
+        </div>
+        <div id="modelState" class="small"></div>
         <div id="chatStatus" class="small"></div>
         <div id="answer" class="answer"></div>
         <div id="sources"></div>
@@ -381,13 +415,19 @@ WEB_UI_HTML = """<!doctype html>
           <input id="instanceName" type="text" placeholder="Navn på chatvindue (fx Hold A Forår 2026)" />
         </div>
         <div class="row">
-          <input id="instanceCode" type="text" placeholder="Kode (valgfri, autogenereres hvis tom)" />
           <input id="instancePassword" type="password" placeholder="Adgangskode til studerende" />
           <button id="publishInstanceBtn" class="primary">Publicér</button>
           <button id="refreshInstancesBtn">Genindlæs chatvinduer</button>
         </div>
         <div id="instancesState" class="small"></div>
         <div id="instancesList" class="stack"></div>
+      </section>
+
+      <section class="card">
+        <h3>Samlet systemprompt (live preview)</h3>
+        <div class="small">Endelig systemprompt, som modellen modtager.</div>
+        <pre id="fullPromptPreview"></pre>
+        <div id="fullPromptState" class="small"></div>
       </section>
 
     </main>
@@ -412,10 +452,15 @@ WEB_UI_HTML = """<!doctype html>
       const promptEditableEl = document.getElementById("promptEditable");
       const promptLockedEl = document.getElementById("promptLocked");
       const promptPreviewEl = document.getElementById("promptPreview");
+      const promptTeacherPreviewEl = document.getElementById("promptTeacherPreview");
+      const promptStudentPreviewEl = document.getElementById("promptStudentPreview");
+      const fullPromptPreviewEl = document.getElementById("fullPromptPreview");
+      const fullPromptStateEl = document.getElementById("fullPromptState");
       const docsState = document.getElementById("docsState");
       const docsList = document.getElementById("docsList");
       const instancesState = document.getElementById("instancesState");
       const instancesList = document.getElementById("instancesList");
+      let livePromptPreviewTimer = null;
 
       function escapeHtml(text) {
         const d = document.createElement("div");
@@ -579,6 +624,8 @@ WEB_UI_HTML = """<!doctype html>
       function showNoCourseOnboarding() {
         courseState.innerHTML = '<span class="ok">Du har ikke et aktivt kursus endnu. Opret dit første kursus nedenfor.</span>';
         promptState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at redigere course prompt.</span>';
+        fullPromptStateEl.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se samlet systemprompt.</span>';
+        fullPromptPreviewEl.textContent = "";
         docsState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se dokumenter.</span>';
         docsList.innerHTML = "";
         chatHistoryEl.innerHTML = '<div class="small">Opret et kursus for at starte chat-historik.</div>';
@@ -687,14 +734,59 @@ WEB_UI_HTML = """<!doctype html>
           promptEditableEl.value = data.editable_instructions || "";
           promptLockedEl.textContent = data.locked_safety_block || "";
           promptPreviewEl.textContent = data.effective_prompt_preview || "";
+          promptTeacherPreviewEl.textContent = data.teacher_prompt_preview || data.effective_prompt_preview || "";
+          promptStudentPreviewEl.textContent = data.student_prompt_preview || "";
           promptState.innerHTML = '<span class="ok">Kursusprompt hentet</span>';
+          fullPromptPreviewEl.textContent = data.effective_prompt_preview || "";
+          fullPromptStateEl.innerHTML = '<span class="ok">Live preview opdateret.</span>';
         } catch (err) {
           if (isNoCourseError(err.message)) {
             promptState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at redigere course prompt.</span>';
+            promptTeacherPreviewEl.textContent = "";
+            promptStudentPreviewEl.textContent = "";
+            fullPromptStateEl.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se samlet systemprompt.</span>';
+            fullPromptPreviewEl.textContent = "";
           } else {
             promptState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+            fullPromptStateEl.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
           }
         }
+      }
+
+      async function refreshLiveSystemPromptPreview() {
+        try {
+          const data = await api("/course/prompt/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              course_title: document.getElementById("courseTitle").value,
+              course_description: document.getElementById("courseDesc").value,
+              editable_instructions: promptEditableEl.value,
+            }),
+          });
+          fullPromptPreviewEl.textContent = data.effective_prompt_preview || "";
+          promptTeacherPreviewEl.textContent = data.teacher_prompt_preview || data.effective_prompt_preview || "";
+          promptStudentPreviewEl.textContent = data.student_prompt_preview || "";
+          fullPromptStateEl.innerHTML = '<span class="ok">Live preview opdateret.</span>';
+        } catch (err) {
+          if (isNoCourseError(err.message)) {
+            fullPromptStateEl.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se samlet systemprompt.</span>';
+            fullPromptPreviewEl.textContent = "";
+            promptTeacherPreviewEl.textContent = "";
+            promptStudentPreviewEl.textContent = "";
+          } else {
+            fullPromptStateEl.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+          }
+        }
+      }
+
+      function scheduleLiveSystemPromptPreview() {
+        if (livePromptPreviewTimer) {
+          clearTimeout(livePromptPreviewTimer);
+        }
+        livePromptPreviewTimer = setTimeout(() => {
+          refreshLiveSystemPromptPreview();
+        }, 250);
       }
 
       async function refreshInstances() {
@@ -729,16 +821,36 @@ WEB_UI_HTML = """<!doctype html>
           const data = await api("/runtime/model");
           const select = document.getElementById("chatModelSelect");
           const models = Array.isArray(data.options) ? data.options : [];
-          select.innerHTML = models.map((m) => `<option value="${escapeHtml(String(m))}">${escapeHtml(String(m))}</option>`).join("");
-          if (!models.length) {
-            select.innerHTML = '<option value="">Ingen modeller fundet</option>';
+          const fallbackModels = ["gemma3:12b", "mistral-nemo"];
+          const finalModels = models.length ? models : fallbackModels;
+          const modelLabel = (m) => {
+            const key = String(m || "").toLowerCase();
+            if (key.includes("gemma3:12b") || key === "gemma3") return "gemma3:12b (12.2B, 131,072 kontekst, hurtig)";
+            if (key.includes("mistral-nemo")) return "mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)";
+            if (key.includes("qwen2.5:14b")) return "qwen2.5:14b-instruct (14B, stærk ræsonnering, lidt tungere)";
+            return String(m);
+          };
+          select.innerHTML = finalModels.map((m) => `<option value="${escapeHtml(String(m))}">${escapeHtml(modelLabel(String(m)))}</option>`).join("");
+          const activeModel = String(data.active_model || "gemma3:12b");
+          if (finalModels.includes(activeModel)) {
+            select.value = activeModel;
+          } else if (finalModels.includes("gemma3:12b")) {
+            select.value = "gemma3:12b";
+          } else if (finalModels.length > 0) {
+            select.value = String(finalModels[0]);
           }
-          if (data.active_model) {
-            select.value = data.active_model;
-          }
-          modelState.innerHTML = `<span class="ok">Aktiv model: ${escapeHtml(String(data.active_model || "ukendt"))}</span>`;
+          modelState.innerHTML = `<span class="ok">Aktiv model: ${escapeHtml(String(select.value || activeModel || "ukendt"))}</span>`;
         } catch (err) {
-          modelState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+          const select = document.getElementById("chatModelSelect");
+          const fallbackModels = ["gemma3:12b", "mistral-nemo"];
+          select.innerHTML = fallbackModels.map((m) => {
+            const label = m.includes("gemma")
+              ? "gemma3:12b (12.2B, 131,072 kontekst, hurtig)"
+              : "mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)";
+            return `<option value="${escapeHtml(String(m))}">${escapeHtml(label)}</option>`;
+          }).join("");
+          select.value = "gemma3:12b";
+          modelState.innerHTML = `<span class="err">Kunne ikke hente modelstatus (${escapeHtml(err.message)}). Du kan stadig vælge model og prøve at gemme.</span>`;
         }
       }
 
@@ -815,9 +927,11 @@ WEB_UI_HTML = """<!doctype html>
           await refreshActiveCourse();
           await refreshCourses();
           await refreshPrompt();
+          await refreshModel();
           await refreshDocuments();
           await refreshChatHistory();
           await refreshInstances();
+          await refreshLiveSystemPromptPreview();
         } catch (err) {
           showGate(err.message);
         }
@@ -844,19 +958,30 @@ WEB_UI_HTML = """<!doctype html>
           await refreshDocuments();
           await refreshChatHistory();
           await refreshInstances();
+          await refreshLiveSystemPromptPreview();
         } catch (err) {
           courseState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
         }
       });
 
-      document.getElementById("refreshCourseBtn").addEventListener("click", refreshActiveCourse);
-      document.getElementById("refreshPromptBtn").addEventListener("click", refreshPrompt);
+      document.getElementById("refreshCourseBtn").addEventListener("click", async () => {
+        await refreshActiveCourse();
+        await refreshLiveSystemPromptPreview();
+      });
+      document.getElementById("refreshPromptBtn").addEventListener("click", async () => {
+        await refreshPrompt();
+        await refreshLiveSystemPromptPreview();
+      });
       document.getElementById("refreshDocsBtn").addEventListener("click", refreshDocuments);
       document.getElementById("refreshInstancesBtn").addEventListener("click", refreshInstances);
+      document.getElementById("courseTitle").addEventListener("input", scheduleLiveSystemPromptPreview);
+      document.getElementById("courseDesc").addEventListener("input", scheduleLiveSystemPromptPreview);
+      promptEditableEl.addEventListener("input", scheduleLiveSystemPromptPreview);
       document.getElementById("newCourseBtn").addEventListener("click", () => {
         document.getElementById("courseTitle").value = "";
         document.getElementById("courseDesc").value = "";
         courseState.innerHTML = '<span class="ok">Udfyld titel og beskrivelse og klik "Placer kursusbeskrivelse og titel i systemprompt".</span>';
+        scheduleLiveSystemPromptPreview();
         document.getElementById("activeCourseCard").scrollIntoView({ behavior: "smooth", block: "start" });
         document.getElementById("courseTitle").focus();
       });
@@ -882,7 +1007,6 @@ WEB_UI_HTML = """<!doctype html>
       document.getElementById("publishInstanceBtn").addEventListener("click", async () => {
         try {
           const name = document.getElementById("instanceName").value.trim();
-          const instance_code = document.getElementById("instanceCode").value.trim();
           const instance_password = document.getElementById("instancePassword").value.trim();
           if (!name || !instance_password) {
             instancesState.innerHTML = '<span class="err">Navn og adgangskode er påkrævet.</span>';
@@ -891,14 +1015,13 @@ WEB_UI_HTML = """<!doctype html>
           const created = await api("/instances", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name, instance_code: instance_code || null, instance_password }),
+            body: JSON.stringify({ name, instance_code: null, instance_password }),
           });
-          const actualCode = created?.instance?.instance_code || instance_code || "";
+          const actualCode = created?.instance?.instance_code || "";
           const studentUrl = buildStudentUrl(actualCode);
           await copyToClipboard(studentUrl);
-          document.getElementById("instanceCode").value = "";
           document.getElementById("instancePassword").value = "";
-          instancesState.innerHTML = '<span class="ok">Chatvindue publiceret. Link kopieret.</span>';
+          instancesState.innerHTML = `<span class="ok">Chatvindue publiceret. Kode: <strong>${escapeHtml(actualCode)}</strong>. Link kopieret.</span>`;
           await refreshInstances();
         } catch (err) {
           instancesState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -921,6 +1044,7 @@ WEB_UI_HTML = """<!doctype html>
           await refreshDocuments();
           await refreshChatHistory();
           await refreshInstances();
+          await refreshLiveSystemPromptPreview();
         } catch (err) {
           coursesState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
         }
@@ -937,6 +1061,7 @@ WEB_UI_HTML = """<!doctype html>
           promptLockedEl.textContent = data.locked_safety_block || "";
           promptPreviewEl.textContent = data.effective_prompt_preview || "";
           promptState.innerHTML = '<span class="ok">Kursusprompt gemt</span>';
+          await refreshLiveSystemPromptPreview();
         } catch (err) {
           promptState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
         }
@@ -1094,7 +1219,7 @@ WEB_UI_HTML = """<!doctype html>
             body: JSON.stringify({ message, k }),
           });
           stopThinking(chatStatus);
-          chatStatus.innerHTML = `<span class="ok">Færdig</span> <span class="mono">intent=${escapeHtml(data.intent || "narrow")} | kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0} | runde=${data.retrieval_rounds ?? 1}</span>`;
+          chatStatus.innerHTML = `<span class="ok">Færdig</span> <span class="mono">intent=${escapeHtml(data.intent || "narrow")} | kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0} | retrieval_runde(r)=${data.retrieval_rounds ?? 1}</span>`;
           answerEl.innerHTML = markdownToHtml(data.answer || "");
           renderGroupedSources(sourcesEl, data);
           await refreshChatHistory();
@@ -1129,6 +1254,7 @@ WEB_UI_HTML = """<!doctype html>
           await refreshDocuments();
           await refreshChatHistory();
           await refreshInstances();
+          await refreshLiveSystemPromptPreview();
         } else {
           showGate("");
         }
@@ -1156,6 +1282,11 @@ STUDENT_UI_HTML = """<!doctype html>
       textarea { min-height: 100px; resize: vertical; }
       button { border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; background: #0f8b8d; color: #fff; font-weight: 600; }
       .warn { background: #d66b19; }
+      button.busy { animation: busyPulse 1s ease-in-out infinite; }
+      @keyframes busyPulse {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(0.985); }
+      }
       .small { font-size: 13px; color: #555; margin-top: 8px; }
       .err { color: #b3261e; }
       .ok { color: #1f7a45; }
@@ -1164,10 +1295,35 @@ STUDENT_UI_HTML = """<!doctype html>
       .answer ul { margin: 0 0 10px 22px; padding: 0; }
       .answer li { margin-bottom: 6px; }
       .answer strong { font-weight: 700; }
+      .history { max-height: 320px; overflow: auto; border-top: 1px dashed #d8d3cb; margin-top: 10px; padding-top: 8px; }
+      .history-item { margin-bottom: 8px; padding: 8px; border: 1px solid #ddd8cf; border-radius: 10px; background: #fff; }
+      .history-role { font-weight: 700; font-size: 12px; color: #666; text-transform: uppercase; }
+      .history-time { font-size: 11px; color: #777; margin-top: 4px; }
       .source { margin-top: 8px; border-top: 1px dashed #d8d3cb; padding-top: 8px; font-size: 13px; }
+      .source h4 { margin: 0 0 4px; font-size: 13px; }
+      .source-snippet { background: #faf9f5; border: 1px solid #e2ddd3; border-radius: 8px; padding: 8px; margin-top: 6px; }
       .doc-item { border: 1px solid #ddd8cf; border-radius: 8px; padding: 8px; margin-bottom: 8px; background: #fff; }
       .doc-item .mono { color: #666; font-size: 12px; }
       .hidden { display: none !important; }
+      .student-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .student-head h3 { margin: 0; }
+      #studentLogoutBtn { margin-left: auto; }
+      .thinking { display: inline-flex; align-items: center; gap: 4px; }
+      .thinking-dots { display: inline-flex; min-width: 22px; }
+      .thinking-dots span { opacity: 0.2; animation: thinkingBlink 1.2s infinite; }
+      .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+      .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+      @keyframes thinkingBlink {
+        0%, 80%, 100% { opacity: 0.2; }
+        40% { opacity: 1; }
+      }
+      .student-compose { margin-top: 12px; border-top: 1px dashed #d8d3cb; padding-top: 10px; }
+      .student-compose .row { margin-top: 8px; }
+      .student-compose textarea { min-height: 96px; }
+      @media (min-width: 961px) {
+        .student-compose .actions { justify-content: flex-end; }
+        .student-compose #studentTopK { max-width: 120px; }
+      }
     </style>
   </head>
   <body>
@@ -1190,20 +1346,24 @@ STUDENT_UI_HTML = """<!doctype html>
             <div id="studentDocs" style="margin-top:10px;"></div>
           </aside>
           <section class="card">
-            <div class="row">
-              <h3 id="instanceTitle" style="margin:0;">Chatvindue</h3>
+            <div class="student-head">
+              <h3 id="instanceTitle">Chatvindue</h3>
               <button id="studentLogoutBtn" class="warn">Log ud</button>
-            </div>
-            <div class="row">
-              <textarea id="studentQuestion" placeholder="Stil et spørgsmål til materialet..."></textarea>
-            </div>
-            <div class="row">
-              <input id="studentTopK" type="number" min="1" max="50" value="5" />
-              <button id="studentAskBtn">Spørg</button>
             </div>
             <div id="studentState" class="small"></div>
             <div id="studentAnswer" class="answer"></div>
             <div id="studentSources"></div>
+            <div class="small"><strong>Samtalehistorik</strong></div>
+            <div id="studentChatHistory" class="history"></div>
+            <div class="student-compose">
+              <div class="row">
+                <textarea id="studentQuestion" placeholder="Stil et spørgsmål til materialet..."></textarea>
+              </div>
+              <div class="row actions">
+                <input id="studentTopK" type="number" min="1" max="50" value="5" />
+                <button id="studentAskBtn">Spørg</button>
+              </div>
+            </div>
           </section>
         </div>
       </section>
@@ -1219,6 +1379,7 @@ STUDENT_UI_HTML = """<!doctype html>
       const instanceTitle = document.getElementById("instanceTitle");
       const answerEl = document.getElementById("studentAnswer");
       const sourcesEl = document.getElementById("studentSources");
+      const studentChatHistoryEl = document.getElementById("studentChatHistory");
       const studentDocsEl = document.getElementById("studentDocs");
       const pathMatch = window.location.pathname.match(/^\\/student\\/i\\/([^/]+)$/);
       const defaultInstanceCode = pathMatch ? decodeURIComponent(pathMatch[1] || "").toUpperCase() : "";
@@ -1259,6 +1420,44 @@ STUDENT_UI_HTML = """<!doctype html>
         return out.join("");
       }
 
+      function cleanDisplayFilename(name) {
+        const raw = String(name || "");
+        return raw.replace(/^\\d{8}-\\d{6}-/, "");
+      }
+
+      function renderGroupedSources(container, data) {
+        container.innerHTML = "";
+        const grouped = Array.isArray(data?.sources) ? data.sources : [];
+        if (!grouped.length) {
+          container.innerHTML = '<div class="small">Ingen kilder fundet.</div>';
+          return;
+        }
+        grouped.forEach((src) => {
+          const ref = escapeHtml(String(src.ref ?? "?"));
+          const filename = escapeHtml(cleanDisplayFilename(String(src.filename || "Ukendt kilde")));
+          const snippets = Array.isArray(src.snippets) ? src.snippets : [];
+          const snippetHtml = snippets.map((sn) => {
+            const full = String(sn.content || "");
+            const short = full.length > 260 ? `${full.slice(0, 260)}...` : full;
+            const page = escapeHtml(String(sn.page_start ?? "?"));
+            const idx = escapeHtml(String(sn.chunk_index ?? "?"));
+            return `
+              <div class="source-snippet">
+                <div class="small">Side ${page} · uddrag ${idx}</div>
+                <div>${escapeHtml(short)}</div>
+                <details><summary>Vis hele uddraget</summary>${escapeHtml(full)}</details>
+              </div>
+            `;
+          }).join("");
+          const div = document.createElement("div");
+          div.className = "source";
+          div.innerHTML = `<h4>[${ref}] ${filename}</h4>${snippetHtml}`;
+          container.appendChild(div);
+        });
+      }
+      // Backward compatibility for stale cached calls with misspelled name.
+      const enderGroupedSources = renderGroupedSources;
+
       const thinkingIntervals = new Map();
 
       function startThinking(el, label = "Tænker") {
@@ -1272,6 +1471,27 @@ STUDENT_UI_HTML = """<!doctype html>
           clearInterval(timer);
           thinkingIntervals.delete(el);
         }
+      }
+
+      function startBusyButton(btn, label = "Arbejder") {
+        const original = btn.textContent || "";
+        btn.dataset.originalLabel = original;
+        btn.disabled = true;
+        btn.classList.add("busy");
+        let dots = 0;
+        btn.textContent = `${label}.`;
+        const timer = setInterval(() => {
+          dots = (dots + 1) % 4;
+          btn.textContent = `${label}${".".repeat(Math.max(1, dots))}`;
+        }, 260);
+        return timer;
+      }
+
+      function stopBusyButton(btn, timer) {
+        if (timer) clearInterval(timer);
+        btn.disabled = false;
+        btn.classList.remove("busy");
+        btn.textContent = btn.dataset.originalLabel || "Spørg";
       }
 
       async function api(path, options = {}) {
@@ -1292,6 +1512,7 @@ STUDENT_UI_HTML = """<!doctype html>
           const data = await api("/student/instance");
           instanceTitle.textContent = data.instance.name || "Chatvindue";
           await refreshStudentDocuments();
+          await refreshStudentChatHistory();
           loginCard.classList.add("hidden");
           studentCard.classList.remove("hidden");
         } catch (err) {
@@ -1313,12 +1534,33 @@ STUDENT_UI_HTML = """<!doctype html>
           }
           studentDocsEl.innerHTML = docs.map((d) => `
             <div class="doc-item">
-              <div><strong>${escapeHtml(d.filename)}</strong></div>
+              <div><strong>${escapeHtml(cleanDisplayFilename(d.filename))}</strong></div>
               <div class="mono">chunks: ${d.chunk_count}</div>
             </div>
           `).join("");
         } catch (err) {
           studentDocsEl.innerHTML = `<div class="small err">${escapeHtml(err.message)}</div>`;
+        }
+      }
+
+      async function refreshStudentChatHistory() {
+        try {
+          const data = await api("/student/chat/history?limit=100");
+          const items = data.messages || [];
+          if (!items.length) {
+            studentChatHistoryEl.innerHTML = '<div class="small">Ingen beskeder endnu.</div>';
+            return;
+          }
+          studentChatHistoryEl.innerHTML = items.map((m) => `
+            <div class="history-item">
+              <div class="history-role">${escapeHtml(m.role)}</div>
+              <div>${m.role === "assistant" ? markdownToHtml(m.content) : escapeHtml(m.content)}</div>
+              <div class="history-time">${escapeHtml(new Date(m.created_at).toLocaleString("da-DK"))}</div>
+            </div>
+          `).join("");
+          studentChatHistoryEl.scrollTop = studentChatHistoryEl.scrollHeight;
+        } catch (err) {
+          studentChatHistoryEl.innerHTML = `<div class="small err">${escapeHtml(err.message)}</div>`;
         }
       }
 
@@ -1354,14 +1596,13 @@ STUDENT_UI_HTML = """<!doctype html>
         loginCard.classList.remove("hidden");
         studentCard.classList.add("hidden");
         loginState.innerHTML = "";
+        studentChatHistoryEl.innerHTML = "";
       });
 
       document.getElementById("studentAskBtn").addEventListener("click", async () => {
         const studentAskBtn = document.getElementById("studentAskBtn");
-        const originalAskLabel = studentAskBtn.textContent || "Spørg";
+        const busyTimer = startBusyButton(studentAskBtn, "Arbejder");
         try {
-          studentAskBtn.disabled = true;
-          studentAskBtn.textContent = "Arbejder...";
           const message = document.getElementById("studentQuestion").value.trim();
           const k = Number(document.getElementById("studentTopK").value || 5);
           if (!message) {
@@ -1380,12 +1621,12 @@ STUDENT_UI_HTML = """<!doctype html>
           studentState.innerHTML = `<span class="ok">Færdig</span> <span class="mono">kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0}</span>`;
           answerEl.innerHTML = markdownToHtml(data.answer || "");
           renderGroupedSources(sourcesEl, data);
+          await refreshStudentChatHistory();
         } catch (err) {
           stopThinking(studentState);
           studentState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
         } finally {
-          studentAskBtn.disabled = false;
-          studentAskBtn.textContent = originalAskLabel;
+          stopBusyButton(studentAskBtn, busyTimer);
         }
       });
 
@@ -1416,6 +1657,12 @@ class ChatRequest(BaseModel):
 
 class PromptRequest(BaseModel):
     editable_instructions: str = Field(min_length=1)
+
+
+class PromptPreviewRequest(BaseModel):
+    course_title: Optional[str] = Field(default=None, max_length=200)
+    course_description: Optional[str] = Field(default=None)
+    editable_instructions: Optional[str] = Field(default=None)
 
 
 class ReingestRequest(BaseModel):
@@ -1474,9 +1721,10 @@ def student_home_instance(instance_code: str) -> str:
 
 
 def _runtime_model_options(settings: object) -> list[str]:
-    configured = [x.strip() for x in os.getenv("CHAT_MODEL_OPTIONS", "gemma3:12b,qwen2.5:14b-instruct").split(",")]
+    configured = [x.strip() for x in os.getenv("CHAT_MODEL_OPTIONS", "gemma3:12b,mistral-nemo").split(",")]
     options = [x for x in configured if x]
-    active = str(getattr(settings, "chat_model", "") or "").strip()
+    active_raw = str(getattr(settings, "chat_model", "") or "").strip()
+    active = "gemma3:12b" if active_raw == "gemma3" else active_raw
     if active and active not in options:
         options.insert(0, active)
     return options
@@ -1486,8 +1734,10 @@ def _runtime_model_options(settings: object) -> list[str]:
 def get_runtime_model(username: str = Depends(require_auth)) -> dict[str, object]:
     settings = load_settings()
     options = _runtime_model_options(settings)
+    active_raw = str(settings.chat_model or "").strip()
+    active = "gemma3:12b" if active_raw == "gemma3" else active_raw
     return {
-        "active_model": settings.chat_model,
+        "active_model": active,
         "options": options,
         "scope": "global_runtime",
     }
@@ -1528,11 +1778,13 @@ def publish_instance(req: InstanceCreateRequest, username: str = Depends(require
     code = _normalize_instance_code(req.instance_code)
 
     with get_connection(settings) as conn:
-        editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
+        teacher_editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
+        student_editable = to_student_editable_instructions(teacher_editable)
         effective_prompt = compose_system_prompt(
-            editable,
+            student_editable,
             course_title=str(course.get("title") or ""),
             course_description=str(course.get("description") or ""),
+            audience="student",
         )
         chosen_code = code
         created = None
@@ -1547,7 +1799,7 @@ def publish_instance(req: InstanceCreateRequest, username: str = Depends(require
                     name=req.name.strip(),
                     instance_code=chosen_code,
                     password_hash=hash_password(req.instance_password),
-                    editable_instructions_snapshot=editable,
+                    editable_instructions_snapshot=student_editable,
                     locked_safety_block_snapshot=LOCKED_SAFETY_BLOCK,
                     effective_system_prompt_snapshot=effective_prompt,
                 )
@@ -1649,26 +1901,44 @@ def student_documents(instance_id: int = Depends(require_student_auth)) -> dict[
     return {"instance_id": instance_id, "documents": docs}
 
 
+@app.get("/student/chat/history")
+def student_chat_history(
+    limit: int = Query(default=100, ge=1, le=500),
+    instance_id: int = Depends(require_student_auth),
+) -> dict[str, object]:
+    settings = load_settings()
+    with get_connection(settings) as conn:
+        item = get_bot_instance_by_id(conn, instance_id)
+        if not item or not item.get("is_active"):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
+        messages = list_student_chat_messages_for_instance(conn, instance_id, limit=limit)
+    return {"instance_id": instance_id, "messages": messages}
+
+
 @app.post("/student/chat")
 def student_chat(req: StudentChatRequest, instance_id: int = Depends(require_student_auth)) -> dict[str, object]:
     settings = load_settings()
     with get_connection(settings) as conn:
         instance = get_bot_instance_by_id(conn, instance_id)
-    if not instance or not instance.get("is_active"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
+        if not instance or not instance.get("is_active"):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
 
-    contexts = search_instance_chunks(req.message, settings, req.k, instance_id)
-    sources = build_grouped_sources(contexts, max_snippets_per_source=1)
-    system_prompt = str(instance["effective_system_prompt_snapshot"])
-    if not contexts:
-        answer = (
-            "Jeg kan ikke svare fagligt sikkert ud fra det publicerede materiale. "
-            "Prøv at omformulere spørgsmålet."
-        )
-        prompt = _build_student_prompt(req.message, sources, system_prompt)
-    else:
-        prompt = _build_student_prompt(req.message, sources, system_prompt)
-        answer = generate_answer(prompt, settings)
+        history = list_student_chat_messages_for_instance(conn, instance_id, limit=20)
+        contexts = search_instance_chunks(req.message, settings, req.k, instance_id)
+        sources = build_grouped_sources(contexts, max_snippets_per_source=1)
+        system_prompt = str(instance["effective_system_prompt_snapshot"])
+        if not contexts:
+            answer = (
+                "Jeg kan ikke svare fagligt sikkert ud fra det publicerede materiale. "
+                "Prøv at omformulere spørgsmålet."
+            )
+            prompt = _build_student_prompt(req.message, sources, system_prompt, history)
+        else:
+            prompt = _build_student_prompt(req.message, sources, system_prompt, history)
+            answer = generate_answer(prompt, settings)
+        insert_student_chat_message(conn, instance_id, "user", req.message)
+        insert_student_chat_message(conn, instance_id, "assistant", str(answer))
+        conn.commit()
 
     citations = []
     for source in sources:
@@ -1746,14 +2016,25 @@ def read_course_prompt(username: str = Depends(require_auth)) -> dict[str, str]:
     course_id = int(course["id"])
     with get_connection(settings) as conn:
         editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
+    student_editable = to_student_editable_instructions(editable)
+    teacher_preview = compose_system_prompt(
+        editable,
+        course_title=str(course.get("title") or ""),
+        course_description=str(course.get("description") or ""),
+        audience="teacher",
+    )
+    student_preview = compose_system_prompt(
+        student_editable,
+        course_title=str(course.get("title") or ""),
+        course_description=str(course.get("description") or ""),
+        audience="student",
+    )
     return {
         "editable_instructions": editable,
         "locked_safety_block": LOCKED_SAFETY_BLOCK,
-        "effective_prompt_preview": compose_system_prompt(
-            editable,
-            course_title=str(course.get("title") or ""),
-            course_description=str(course.get("description") or ""),
-        ),
+        "effective_prompt_preview": teacher_preview,
+        "teacher_prompt_preview": teacher_preview,
+        "student_prompt_preview": student_preview,
     }
 
 
@@ -1765,14 +2046,61 @@ def update_course_prompt(req: PromptRequest, username: str = Depends(require_aut
     with get_connection(settings) as conn:
         upsert_course_prompt(conn, course_id, req.editable_instructions)
         conn.commit()
+    student_editable = to_student_editable_instructions(req.editable_instructions)
+    teacher_preview = compose_system_prompt(
+        req.editable_instructions,
+        course_title=str(course.get("title") or ""),
+        course_description=str(course.get("description") or ""),
+        audience="teacher",
+    )
+    student_preview = compose_system_prompt(
+        student_editable,
+        course_title=str(course.get("title") or ""),
+        course_description=str(course.get("description") or ""),
+        audience="student",
+    )
     return {
         "editable_instructions": req.editable_instructions,
         "locked_safety_block": LOCKED_SAFETY_BLOCK,
-        "effective_prompt_preview": compose_system_prompt(
-            req.editable_instructions,
-            course_title=str(course.get("title") or ""),
-            course_description=str(course.get("description") or ""),
-        ),
+        "effective_prompt_preview": teacher_preview,
+        "teacher_prompt_preview": teacher_preview,
+        "student_prompt_preview": student_preview,
+    }
+
+
+@app.post("/course/prompt/preview")
+def preview_course_prompt(req: PromptPreviewRequest, username: str = Depends(require_auth)) -> dict[str, str]:
+    settings = load_settings()
+    course = _active_course_for_request(username)
+    course_id = int(course["id"])
+    with get_connection(settings) as conn:
+        saved_editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
+
+    editable = req.editable_instructions if req.editable_instructions is not None else saved_editable
+    title = req.course_title if req.course_title is not None else str(course.get("title") or "")
+    description = (
+        req.course_description if req.course_description is not None else str(course.get("description") or "")
+    )
+
+    student_editable = to_student_editable_instructions(editable)
+    teacher_preview = compose_system_prompt(
+        editable,
+        course_title=title,
+        course_description=description,
+        audience="teacher",
+    )
+    student_preview = compose_system_prompt(
+        student_editable,
+        course_title=title,
+        course_description=description,
+        audience="student",
+    )
+    return {
+        "editable_instructions": editable,
+        "locked_safety_block": LOCKED_SAFETY_BLOCK,
+        "effective_prompt_preview": teacher_preview,
+        "teacher_prompt_preview": teacher_preview,
+        "student_prompt_preview": student_preview,
     }
 
 
@@ -1876,15 +2204,35 @@ def _generate_instance_code(length: int = 8) -> str:
     return "".join(choice(INSTANCE_CODE_ALPHABET) for _ in range(length))
 
 
-def _build_student_prompt(query: str, sources: List[dict[str, object]], system_prompt: str) -> str:
+def _format_student_history(history: List[dict[str, object]]) -> str:
+    if not history:
+        return "(ingen)"
+    lines: List[str] = []
+    for item in history:
+        role = str(item.get("role") or "unknown").upper()
+        content = str(item.get("content") or "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines) if lines else "(ingen)"
+
+
+def _build_student_prompt(
+    query: str,
+    sources: List[dict[str, object]],
+    system_prompt: str,
+    history: List[dict[str, object]],
+) -> str:
     blocks: List[str] = []
     for source in sources:
         ref = int(source.get("ref") or 0)
         for snippet in source.get("snippets") or []:
             blocks.append(f"[{ref}] {snippet.get('filename')} p{snippet.get('page_start')}\n{snippet.get('content')}")
     context_text = "\n\n".join(blocks)
+    history_text = _format_student_history(history)
     return (
         system_prompt
+        + "\n\nSAMTALEHISTORIK:\n"
+        + history_text
         + "\n\nKILDER:\n"
         + context_text
         + "\n\nBRUGERSPØRGSMÅL:\n"

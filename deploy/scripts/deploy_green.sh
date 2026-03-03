@@ -7,12 +7,16 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/home/ucloud/RUCAI}"
 BRANCH="${BRANCH:-release/gpu-pilot}"
 PORT="${PORT:-8011}"
+APP_PORT="${APP_PORT:-$PORT}"
 SERVICE_NAME="${SERVICE_NAME:-rucai-api}"
 SKIP_GIT="${SKIP_GIT:-0}"
 RUNNER_MODE="${RUNNER_MODE:-auto}"
 TMUX_SESSION="${TMUX_SESSION:-rucai-api}"
+ACCESS_MODE="${ACCESS_MODE:-none}"
+ENABLE_CLOUDFLARE_TUNNEL="${ENABLE_CLOUDFLARE_TUNNEL:-0}"
+ENABLE_OPS_MONITOR="${ENABLE_OPS_MONITOR:-1}"
 
-if [[ ! -d "$APP_DIR/.git" ]]; then
+if [[ "$SKIP_GIT" != "1" && ! -d "$APP_DIR/.git" ]]; then
   echo "Missing git repo at $APP_DIR"
   exit 1
 fi
@@ -42,6 +46,13 @@ if [[ ! -f .env ]]; then
   cp deploy/env/.env.green.template .env
   echo "Fill secrets in $APP_DIR/.env before starting the service."
 fi
+# Load deploy/runtime flags from .env
+set -a
+source .env
+set +a
+
+# Keep explicit env value as override if provided at runtime.
+ACCESS_MODE="${ACCESS_MODE:-none}"
 
 SYSTEMD_OK=0
 if [[ "$RUNNER_MODE" == "systemd" ]]; then
@@ -86,11 +97,72 @@ else
   echo "       Attach: tmux attach -t $TMUX_SESSION"
 fi
 
-echo "[7/7] Health check"
+echo "[7/8] Health check"
+health_ok=0
+for _ in $(seq 1 30); do
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      health_ok=1
+      break
+    fi
+  else
+    if wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      health_ok=1
+      break
+    fi
+  fi
+  sleep 1
+done
+if [[ "$health_ok" != "1" ]]; then
+  echo "Health check failed for http://127.0.0.1:${PORT}/health"
+  exit 1
+fi
 if command -v curl >/dev/null 2>&1; then
   curl -fsS "http://127.0.0.1:${PORT}/health" && echo
 else
   wget -qO- "http://127.0.0.1:${PORT}/health" && echo
+fi
+
+echo "[8/8] Access mode: $ACCESS_MODE"
+case "$ACCESS_MODE" in
+  reverse_ssh)
+    APP_DIR="$APP_DIR" APP_PORT="$APP_PORT" PORT="$PORT" bash deploy/scripts/reverse_tunnel.sh install
+    APP_DIR="$APP_DIR" APP_PORT="$APP_PORT" PORT="$PORT" bash deploy/scripts/reverse_tunnel.sh start
+    APP_DIR="$APP_DIR" bash deploy/scripts/reverse_tunnel.sh status || true
+    ;;
+  cloudflare)
+    bash deploy/scripts/cloudflare_tunnel.sh install
+    APP_DIR="$APP_DIR" APP_PORT="$APP_PORT" PORT="$PORT" bash deploy/scripts/cloudflare_tunnel.sh start
+    public_url="$(APP_DIR="$APP_DIR" bash deploy/scripts/cloudflare_tunnel.sh url || true)"
+    if [[ -n "$public_url" ]]; then
+      echo "Public URL: $public_url"
+    fi
+    ;;
+  none)
+    # Backward compatibility: old env-based cloudflare toggle.
+    if [[ "$ENABLE_CLOUDFLARE_TUNNEL" == "1" ]]; then
+      bash deploy/scripts/cloudflare_tunnel.sh install
+      APP_DIR="$APP_DIR" APP_PORT="$APP_PORT" PORT="$PORT" bash deploy/scripts/cloudflare_tunnel.sh start
+      public_url="$(APP_DIR="$APP_DIR" bash deploy/scripts/cloudflare_tunnel.sh url || true)"
+      if [[ -n "$public_url" ]]; then
+        echo "Public URL: $public_url"
+      fi
+    else
+      echo "No public tunnel started (ACCESS_MODE=none)."
+    fi
+    ;;
+  *)
+    echo "Unknown ACCESS_MODE='$ACCESS_MODE'. Use one of: reverse_ssh, cloudflare, none."
+    exit 1
+    ;;
+esac
+
+echo "[9/9] Ops monitor"
+if [[ "$ENABLE_OPS_MONITOR" == "1" ]]; then
+  APP_DIR="$APP_DIR" APP_PORT="$APP_PORT" bash deploy/scripts/ops_monitor.sh start
+  APP_DIR="$APP_DIR" APP_PORT="$APP_PORT" bash deploy/scripts/ops_monitor.sh status || true
+else
+  echo "Ops monitor disabled (ENABLE_OPS_MONITOR=0)."
 fi
 
 echo "Deploy completed."

@@ -43,7 +43,7 @@ def load_settings() -> Settings:
         db_password=os.getenv("DB_PASSWORD", ""),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         embed_model=os.getenv("EMBED_MODEL", "bge-m3"),
-        chat_model=os.getenv("CHAT_MODEL", "gemma3"),
+        chat_model=os.getenv("CHAT_MODEL", "gemma3:12b"),
         auth_username=os.getenv("AUTH_USERNAME", "frede"),
         auth_password=os.getenv("AUTH_PASSWORD", "rucai-dev-password"),
         auth_users_file=Path(os.getenv("AUTH_USERS_FILE", str(data_root / "auth_users.json"))),
