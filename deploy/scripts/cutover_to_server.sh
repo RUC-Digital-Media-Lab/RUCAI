@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cut over domain traffic to SERVER-hosted RUCAI runtime.
+# Run on SERVER.
+#
+# Optional env:
+#   APP_DIR                default: /home/frede/RUCAI
+#   RUN_SYNC               default: 1 (UCloud -> server)
+#   RUN_DEPLOY             default: 1
+#   RUN_SWITCH             default: 1
+#   RUN_DOMAIN_CHECK       default: 1
+#   DOMAIN_HEALTH_URL      default: https://www.rucai.dk/health
+#
+# Sync env forwarded to sync_ucloud_to_server.sh:
+#   UCLOUD_SSH, UCLOUD_SSH_PORT, UCLOUD_APP_DIR, UCLOUD_UPLOAD_ROOT, ...
+
+APP_DIR="${APP_DIR:-/home/frede/RUCAI}"
+RUN_SYNC="${RUN_SYNC:-1}"
+RUN_DEPLOY="${RUN_DEPLOY:-1}"
+RUN_SWITCH="${RUN_SWITCH:-1}"
+RUN_DOMAIN_CHECK="${RUN_DOMAIN_CHECK:-1}"
+DOMAIN_HEALTH_URL="${DOMAIN_HEALTH_URL:-https://www.rucai.dk/health}"
+MAINTENANCE_WINDOW="${MAINTENANCE_WINDOW:-0}"
+
+cd "$APP_DIR"
+
+echo "[cutover_to_server] app_dir=$APP_DIR"
+
+if [[ "$MAINTENANCE_WINDOW" == "1" ]]; then
+  echo "[prep] Enable maintenance window"
+  ACTION=install_hook bash deploy/scripts/maintenance_banner.sh
+  ACTION=enable bash deploy/scripts/maintenance_banner.sh
+  trap 'ACTION=disable bash deploy/scripts/maintenance_banner.sh || true' EXIT
+fi
+
+if [[ "$RUN_SYNC" == "1" ]]; then
+  echo "[1/4] Sync UCloud -> server"
+  : "${UCLOUD_SSH:=ucloud@ssh.cloud.sdu.dk}"
+  : "${UCLOUD_SSH_PORT:=2485}"
+  : "${UCLOUD_APP_DIR:=/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
+  : "${UCLOUD_UPLOAD_ROOT:=/work/FrederikMøllerHenriksen#7467/projects/RUCAI/data/uploads}"
+  export UCLOUD_SSH UCLOUD_SSH_PORT UCLOUD_APP_DIR UCLOUD_UPLOAD_ROOT
+  export SERVER_APP_DIR="${SERVER_APP_DIR:-$APP_DIR}"
+  export SERVER_UPLOAD_ROOT="${SERVER_UPLOAD_ROOT:-$APP_DIR/data/uploads}"
+  bash deploy/scripts/sync_ucloud_to_server.sh
+else
+  echo "[1/4] Skip sync (RUN_SYNC=0)"
+fi
+
+if [[ "$RUN_DEPLOY" == "1" ]]; then
+  echo "[2/4] Start/refresh server runtime"
+  SKIP_GIT=1 APP_DIR="$APP_DIR" BRANCH="${BRANCH:-main}" bash deploy/scripts/deploy_green.sh
+else
+  echo "[2/4] Skip deploy (RUN_DEPLOY=0)"
+fi
+
+if [[ "$RUN_SWITCH" == "1" ]]; then
+  echo "[3/4] Switch nginx upstream to server app"
+  MODE=server bash deploy/scripts/switch_domain_upstream.sh
+else
+  echo "[3/4] Skip upstream switch (RUN_SWITCH=0)"
+fi
+
+echo "[4/4] Health checks"
+curl -fsS -m 8 http://127.0.0.1:8011/health && echo
+if [[ "$RUN_DOMAIN_CHECK" == "1" ]]; then
+  curl -fsS -m 12 "$DOMAIN_HEALTH_URL" && echo
+fi
+
+if [[ "$MAINTENANCE_WINDOW" == "1" ]]; then
+  ACTION=disable bash deploy/scripts/maintenance_banner.sh
+  trap - EXIT
+fi
+
+echo "Cutover-to-server completed."
