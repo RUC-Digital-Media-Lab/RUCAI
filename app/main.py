@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime
 from secrets import choice
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pathlib import Path
 from threading import Thread
 
@@ -21,7 +21,16 @@ from .auth import (
     require_student_auth,
     verify_password,
 )
-from .chat import build_grouped_sources, chat_response
+from .chat import (
+    build_grouped_sources,
+    chat_response,
+    has_explicit_document_hint,
+    contexts_match_query_document_hint,
+    filter_contexts_for_explicit_doc_mention,
+    filter_reference_noise,
+    query_document_tokens,
+    select_source_first_contexts,
+)
 from .config import ensure_data_dirs, load_settings
 from .db import (
     course_belongs_to_owner,
@@ -31,6 +40,7 @@ from .db import (
     create_or_activate_course,
     delete_chat_messages_for_course,
     delete_document,
+    delete_bot_instance,
     document_belongs_to_course,
     ensure_schema,
     get_active_course,
@@ -47,6 +57,7 @@ from .db import (
     insert_chat_message,
     list_chat_messages_for_course,
     list_student_chat_messages_for_instance,
+    delete_student_chat_messages_for_instance,
     list_documents_for_course,
     set_active_course_by_id,
     set_bot_instance_status,
@@ -58,6 +69,8 @@ from .llm import generate_answer
 from .prompts import (
     DEFAULT_EDITABLE_INSTRUCTIONS,
     LOCKED_SAFETY_BLOCK,
+    LOCKED_SAFETY_BLOCK_DA,
+    LOCKED_SAFETY_BLOCK_EN,
     compose_system_prompt,
     to_student_editable_instructions,
 )
@@ -70,12 +83,50 @@ if LOGO_DIR.exists():
 
 INSTANCE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
+
+def _umami_bootstrap_html() -> str:
+    website_id = os.getenv("UMAMI_WEBSITE_ID", "").strip()
+    if not website_id:
+        return ""
+
+    script_url = os.getenv("UMAMI_SCRIPT_URL", "https://cloud.umami.is/script.js").strip()
+    host_url = os.getenv("UMAMI_HOST_URL", "https://cloud.umami.is").strip()
+    domains_raw = os.getenv("UMAMI_DOMAINS", "").strip()
+    domains = ",".join([d.strip() for d in domains_raw.split(",") if d.strip()])
+
+    set_domains_js = ""
+    if domains:
+        set_domains_js = f'script.setAttribute("data-domains", {json.dumps(domains)});'
+
+    return (
+        "<script>"
+        "(function(){"
+        'var id="umami-script";'
+        "if(document.getElementById(id)){return;}"
+        "var script=document.createElement('script');"
+        "script.id=id;"
+        "script.async=true;"
+        f"script.src={json.dumps(script_url)};"
+        f"script.setAttribute('data-website-id',{json.dumps(website_id)});"
+        f"script.setAttribute('data-host-url',{json.dumps(host_url)});"
+        f"{set_domains_js}"
+        "document.head.appendChild(script);"
+        "})();"
+        "</script>"
+    )
+
+
+def _inject_umami(html: str) -> str:
+    return html.replace("<!-- UMAMI_BOOTSTRAP -->", _umami_bootstrap_html())
+
+
 WEB_UI_HTML = """<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>RUCAI</title>
+    <!-- UMAMI_BOOTSTRAP -->
     <style>
       :root {
         --bg: #f8f7f2;
@@ -133,6 +184,10 @@ WEB_UI_HTML = """<!doctype html>
       @media (max-width: 960px) {
         .header-actions { position: static; margin-top: 10px; }
       }
+      .lang-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-right: 8px; background: rgba(255,255,255,0.85); vertical-align: middle; }
+      .lang-toggle-btn { border: 0; border-radius: 0; padding: 8px 12px; background: transparent; font-weight: 700; min-width: 48px; }
+      .lang-toggle-btn + .lang-toggle-btn { border-left: 1px solid var(--border); }
+      .lang-toggle-btn.active { background: linear-gradient(135deg, var(--accent), var(--accent-dark)); color: #fff; }
       .card {
         border: 1px solid var(--border);
         background: var(--panel);
@@ -179,6 +234,7 @@ WEB_UI_HTML = """<!doctype html>
         50% { transform: scale(0.985); }
       }
       .small { font-size: 13px; color: var(--muted); margin-top: 8px; }
+      #aboutBody { font-size: 16px; line-height: 1.65; color: var(--ink); }
       .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
       .ok { color: var(--ok); }
       .err { color: var(--danger); }
@@ -285,13 +341,17 @@ WEB_UI_HTML = """<!doctype html>
       <header class="header">
         <h1>RUCAI</h1>
         <div class="header-actions">
+          <div class="lang-toggle" role="group" aria-label="Language toggle">
+            <button id="uiLangDaBtn" type="button" class="lang-toggle-btn">DA</button>
+            <button id="uiLangEnBtn" type="button" class="lang-toggle-btn">EN</button>
+          </div>
           <button id="logoutTopBtn" class="warn">Log ud</button>
         </div>
       </header>
 
       <section class="card">
-        <h3>Hvad er RUCAI?</h3>
-        <div class="small">
+        <h3 id="aboutTitle">Hvad er RUCAI?</h3>
+        <div class="small" id="aboutBody">
           RUCAI er sat i verden til at understøtte kursusplanlægning og afvikling.
           Ideen er at underviser kan designe og tilrettelægge undervisning med udgangspunkt i kursusbeskrivelse og pensum
           og så oprette ”chat” vinduer, som studerende så kan tilgå i forbindelse med undervisning.
@@ -300,8 +360,8 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card sidebar">
-        <h3>Kurser</h3>
-        <div class="small">Skift mellem dine kurser.</div>
+        <h3 id="coursesTitle">Kurser</h3>
+        <div class="small" id="coursesSub">Skift mellem dine kurser.</div>
         <div class="row">
           <button id="newCourseBtn" class="primary" style="width:100%;">Nyt kursus</button>
         </div>
@@ -310,7 +370,7 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card" id="activeCourseCard">
-        <h3>Information om kurset</h3>
+        <h3 id="courseInfoTitle">Information om kurset</h3>
         <div class="row">
           <input id="courseTitle" type="text" placeholder="Kursustitel" />
         </div>
@@ -325,13 +385,13 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card">
-        <h3>Kursusprompt
+        <h3 id="promptTitle">Kursusprompt
           <span class="tip-wrap">
-            <span class="tip-icon" tabindex="0" aria-label="Tips til prompt-teknik">I</span>
-            <span class="tip-text">God prompt-teknik: Vær konkret om målgruppe, læringsmål, ønsket svarformat og længde. Bed om kildehenvisninger, og sig tydeligt hvad modellen skal gøre ved usikkerhed.</span>
+            <span id="promptTipIcon" class="tip-icon" tabindex="0" aria-label="Tips til prompt-teknik">I</span>
+            <span id="promptTipText" class="tip-text">God prompt-teknik: Vær konkret om målgruppe, læringsmål, ønsket svarformat og længde. Bed om kildehenvisninger, og sig tydeligt hvad modellen skal gøre ved usikkerhed.</span>
           </span>
         </h3>
-        <div class="small">Du kan redigere undervisningsinstruktionen. Nogle grundregler er faste for at sikre kildebaserede og ansvarlige svar.</div>
+        <div id="promptSub" class="small">Du kan redigere undervisningsinstruktionen. Nogle grundregler er faste for at sikre kildebaserede og ansvarlige svar.</div>
         <div class="row">
           <textarea id="promptEditable" placeholder="Redigerbar kursusinstruktion"></textarea>
         </div>
@@ -340,19 +400,19 @@ WEB_UI_HTML = """<!doctype html>
           <button id="refreshPromptBtn">Hent kursusprompt</button>
         </div>
         <details class="small">
-          <summary>Faste grundregler (kan ikke redigeres)</summary>
+          <summary id="lockedRulesSummary">Faste grundregler (kan ikke redigeres)</summary>
           <pre id="promptLocked"></pre>
         </details>
         <details class="small">
-          <summary>Aktiv prompt (preview)</summary>
+          <summary id="activePromptSummary">Aktiv prompt (preview)</summary>
           <pre id="promptPreview"></pre>
         </details>
         <details class="small">
-          <summary>Underviser-prompt (aktiv)</summary>
+          <summary id="teacherPromptSummary">Underviser-prompt (aktiv)</summary>
           <pre id="promptTeacherPreview"></pre>
         </details>
         <details class="small">
-          <summary>Studenter-prompt (ved publicering)</summary>
+          <summary id="studentPromptSummary">Studenter-prompt (ved publicering)</summary>
           <pre id="promptStudentPreview"></pre>
         </details>
         <div id="promptState" class="small"></div>
@@ -360,7 +420,7 @@ WEB_UI_HTML = """<!doctype html>
 
       <section class="split-two">
         <section class="card">
-          <h3>Upload PDF/DOCX</h3>
+          <h3 id="uploadTitle">Upload PDF/DOCX</h3>
           <div class="row">
             <input id="docFile" type="file" multiple accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
             <button id="uploadBtn" class="primary">Upload og indlæs</button>
@@ -370,7 +430,7 @@ WEB_UI_HTML = """<!doctype html>
         </section>
 
         <section class="card">
-          <h3>Dokumenter</h3>
+          <h3 id="documentsTitle">Dokumenter</h3>
           <div class="row">
             <button id="refreshDocsBtn">Genindlæs dokumentliste</button>
           </div>
@@ -380,13 +440,19 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card">
-        <h3>Chat</h3>
+        <h3 id="chatTitle">Chat</h3>
         <div class="row">
-          <label for="topK" class="small">Kilder pr. svar (k)</label>
+          <label id="topKLabel" for="topK" class="small">Kilder pr. svar (k)</label>
           <input id="topK" type="number" min="1" max="50" value="5" />
+          <label id="answerLangLabel" for="answerLangSelect" class="small">Svarsprog</label>
+          <select id="answerLangSelect" style="min-width:160px;">
+            <option id="answerLangAutoOption" value="auto">Auto (UI-sprog)</option>
+            <option value="da">Dansk</option>
+            <option value="en">English</option>
+          </select>
         </div>
         <div class="row">
-          <label for="chatModelSelect" class="small">Model</label>
+          <label id="modelLabel" for="chatModelSelect" class="small">Model</label>
           <select id="chatModelSelect" style="min-width:240px;">
             <option value="gemma3:12b" selected>gemma3:12b (12.2B, 131,072 kontekst, hurtig)</option>
             <option value="mistral-nemo">mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)</option>
@@ -397,7 +463,9 @@ WEB_UI_HTML = """<!doctype html>
         <div id="chatStatus" class="small"></div>
         <div id="answer" class="answer"></div>
         <div id="sources"></div>
-        <div class="small"><strong>Samtalehistorik</strong> (for aktivt kursus)</div>
+        <div class="small"><strong id="referenceMentionsTitle">Nævnt i pensumtekster (ikke pensumkilder)</strong></div>
+        <div id="referenceMentions"></div>
+        <div class="small"><strong id="chatHistoryTitle">Samtalehistorik</strong> <span id="chatHistorySub">(for aktivt kursus)</span></div>
         <div id="chatHistory" class="history"></div>
         <div class="chat-compose">
           <textarea id="question" placeholder="Spørg ind til pensum, teksterne eller øvelserne..."></textarea>
@@ -409,10 +477,22 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card">
-        <h3>Skab studenter-chatvinduer</h3>
-        <div class="small">Publicér en låst chatbot til studerende ud fra aktivt kursus.</div>
+        <h3 id="instancesTitle">Skab studenter-chatvinduer</h3>
+        <div id="instancesSub" class="small">Publicér en låst chatbot til studerende ud fra aktivt kursus.</div>
         <div class="row">
-          <input id="instanceName" type="text" placeholder="Navn på chatvindue (fx Hold A Forår 2026)" />
+          <textarea id="instanceStudentPrompt" placeholder="Student-prompt (final for denne instance)" style="min-height:160px;"></textarea>
+        </div>
+        <div class="row">
+          <label style="display:flex;align-items:center;gap:8px;">
+            <input id="instancePromptReviewed" type="checkbox" />
+            <span id="instancePromptReviewedLabel">Jeg har gennemgået student-prompten før publicering</span>
+          </label>
+        </div>
+        <div class="small" id="instanceFieldsHint">
+          Chatvindue-navn er den interne titel i underviser-overblikket. Adgangskode er det, studerende bruger til login.
+        </div>
+        <div class="row">
+          <input id="instanceName" type="text" placeholder="Chatvindue-navn (fx Hold A Forår 2026)" />
         </div>
         <div class="row">
           <input id="instancePassword" type="password" placeholder="Adgangskode til studerende" />
@@ -424,8 +504,8 @@ WEB_UI_HTML = """<!doctype html>
       </section>
 
       <section class="card">
-        <h3>Samlet systemprompt (live preview)</h3>
-        <div class="small">Endelig systemprompt, som modellen modtager.</div>
+        <h3 id="fullPromptTitle">Samlet systemprompt (live preview)</h3>
+        <div id="fullPromptSub" class="small">Endelig systemprompt, som modellen modtager.</div>
         <pre id="fullPromptPreview"></pre>
         <div id="fullPromptState" class="small"></div>
       </section>
@@ -434,6 +514,9 @@ WEB_UI_HTML = """<!doctype html>
 
     <script>
       let token = localStorage.getItem("rucai_token") || "";
+      const browserLang = (navigator.language || "da").toLowerCase().startsWith("da") ? "da" : "en";
+      let uiLang = localStorage.getItem("rucai_ui_lang") || browserLang;
+      let answerLangMode = localStorage.getItem("rucai_answer_lang") || "auto";
       let activeCourseId = null;
       const gate = document.getElementById("loginGate");
       const appShell = document.getElementById("appShell");
@@ -446,6 +529,7 @@ WEB_UI_HTML = """<!doctype html>
       const chatStatus = document.getElementById("chatStatus");
       const answerEl = document.getElementById("answer");
       const sourcesEl = document.getElementById("sources");
+      const referenceMentionsEl = document.getElementById("referenceMentions");
       const chatHistoryEl = document.getElementById("chatHistory");
       const promptState = document.getElementById("promptState");
       const modelState = document.getElementById("modelState");
@@ -456,11 +540,242 @@ WEB_UI_HTML = """<!doctype html>
       const promptStudentPreviewEl = document.getElementById("promptStudentPreview");
       const fullPromptPreviewEl = document.getElementById("fullPromptPreview");
       const fullPromptStateEl = document.getElementById("fullPromptState");
+      const instanceStudentPromptEl = document.getElementById("instanceStudentPrompt");
+      const instancePromptReviewedEl = document.getElementById("instancePromptReviewed");
       const docsState = document.getElementById("docsState");
       const docsList = document.getElementById("docsList");
       const instancesState = document.getElementById("instancesState");
       const instancesList = document.getElementById("instancesList");
+      const uiLangDaBtn = document.getElementById("uiLangDaBtn");
+      const uiLangEnBtn = document.getElementById("uiLangEnBtn");
+      const answerLangSelect = document.getElementById("answerLangSelect");
       let livePromptPreviewTimer = null;
+
+      const I18N = {
+        da: {
+          logout: "Log ud",
+          login: "Log ind",
+          loginTitle: "RUCAI Log ind",
+          loginSub: "Log ind for at åbne platformen.",
+          usernamePlaceholder: "brugernavn",
+          passwordPlaceholder: "adgangskode",
+          aboutTitle: "Hvad er RUCAI?",
+          aboutBody: "RUCAI er sat i verden til at understøtte kursusplanlægning og afvikling. Ideen er at underviser kan designe og tilrettelægge undervisning med udgangspunkt i kursusbeskrivelse og pensum og så oprette ”chat” vinduer, som studerende så kan tilgå i forbindelse med undervisning. Chat-historik gemmes pr. kursusgang, så samtaler kan fortsætte over tid.",
+          coursesTitle: "Kurser",
+          coursesSub: "Skift mellem dine kurser.",
+          newCourseBtn: "Nyt kursus",
+          courseInfoTitle: "Information om kurset",
+          courseTitlePlaceholder: "Kursustitel",
+          courseDescPlaceholder: "Kursusbeskrivelse",
+          setCourseBtn: "Placer kursusbeskrivelse og titel i systemprompt",
+          refreshCourseBtn: "Genindlæs visning",
+          promptTitle: "Kursusprompt",
+          promptTipAria: "Tips til prompt-teknik",
+          promptTipText: "God prompt-teknik: Vær konkret om målgruppe, læringsmål, ønsket svarformat og længde. Bed om kildehenvisninger, og sig tydeligt hvad modellen skal gøre ved usikkerhed.",
+          promptSub: "Du kan redigere undervisningsinstruktionen. Nogle grundregler er faste for at sikre kildebaserede og ansvarlige svar.",
+          promptPlaceholder: "Redigerbar kursusinstruktion",
+          savePromptBtn: "Gem kursusprompt",
+          refreshPromptBtn: "Hent kursusprompt",
+          lockedRulesSummary: "Faste grundregler (kan ikke redigeres)",
+          activePromptSummary: "Aktiv prompt (preview)",
+          teacherPromptSummary: "Underviser-prompt (aktiv)",
+          studentPromptSummary: "Studenter-prompt (ved publicering)",
+          uploadTitle: "Upload PDF/DOCX",
+          uploadBtn: "Upload og indlæs",
+          documentsTitle: "Dokumenter",
+          refreshDocsBtn: "Genindlæs dokumentliste",
+          chatTitle: "Chat",
+          topKLabel: "Kilder pr. svar (k)",
+          answerLangLabel: "Svarsprog",
+          answerLangAuto: "Auto (UI-sprog)",
+          modelLabel: "Model",
+          saveModelBtn: "Gem model",
+          chatHistoryTitle: "Samtalehistorik",
+          referenceMentionsTitle: "Nævnt i pensumtekster (ikke pensumkilder)",
+          noReferenceMentions: "Ingen nævnte eksterne kilder fundet.",
+          chatHistorySub: "(for aktivt kursus)",
+          questionPlaceholder: "Spørg ind til pensum, teksterne eller øvelserne...",
+          chatBtn: "Spørg",
+          newChatBtn: "Ny samtale",
+          instancesTitle: "Skab studenter-chatvinduer",
+          instancesSub: "Publicér en låst chatbot til studerende ud fra aktivt kursus.",
+          instanceFieldsHint: "Chatvindue-navn er den interne titel i underviser-overblikket. Adgangskode er det, studerende bruger til login.",
+          instanceNamePlaceholder: "Chatvindue-navn (fx Hold A Forår 2026)",
+          instanceStudentPromptPlaceholder: "Student-prompt (final for denne instance)",
+          instancePromptReviewedLabel: "Jeg har gennemgået student-prompten før publicering",
+          instancePasswordPlaceholder: "Adgangskode til studerende",
+          publishInstanceBtn: "Publicér",
+          refreshInstancesBtn: "Genindlæs chatvinduer",
+          deleteBtn: "Slet",
+          fullPromptTitle: "Samlet systemprompt (live preview)",
+          fullPromptSub: "Endelig systemprompt, som modellen modtager.",
+          working: "Arbejder",
+          thinking: "Tænker",
+          writeQuestionError: "Skriv et spørgsmål.",
+          writeCoursePrompt: "Vælg eller opret et kursus for at redigere course prompt.",
+          noMessages: "Ingen beskeder endnu.",
+          sourceLabel: "kilder",
+          chunkLabel: "uddrag",
+          roundsLabel: "retrieval_runde(r)",
+          done: "Færdig",
+          activeModel: "Aktiv model",
+        },
+        en: {
+          logout: "Log out",
+          login: "Log in",
+          loginTitle: "RUCAI Login",
+          loginSub: "Log in to open the platform.",
+          usernamePlaceholder: "username",
+          passwordPlaceholder: "password",
+          aboutTitle: "What is RUCAI?",
+          aboutBody: "RUCAI supports course planning and delivery. Teachers can design course-specific assistants from course descriptions and readings, then publish chat windows that students can access in class. Chat history is stored per course session so conversations can continue over time.",
+          coursesTitle: "Courses",
+          coursesSub: "Switch between your courses.",
+          newCourseBtn: "New course",
+          courseInfoTitle: "Course information",
+          courseTitlePlaceholder: "Course title",
+          courseDescPlaceholder: "Course description",
+          setCourseBtn: "Place course description and title in system prompt",
+          refreshCourseBtn: "Refresh view",
+          promptTitle: "Course prompt",
+          promptTipAria: "Prompt writing tips",
+          promptTipText: "Good prompt practice: be specific about audience, learning goals, response format, and length. Ask for citations and tell the model how to handle uncertainty.",
+          promptSub: "You can edit the instructional prompt. Core safety rules are fixed to ensure grounded responses.",
+          promptPlaceholder: "Editable course instruction",
+          savePromptBtn: "Save course prompt",
+          refreshPromptBtn: "Load course prompt",
+          lockedRulesSummary: "Fixed ground rules (not editable)",
+          activePromptSummary: "Active prompt (preview)",
+          teacherPromptSummary: "Teacher prompt (active)",
+          studentPromptSummary: "Student prompt (on publish)",
+          uploadTitle: "Upload PDF/DOCX",
+          uploadBtn: "Upload and ingest",
+          documentsTitle: "Documents",
+          refreshDocsBtn: "Refresh document list",
+          chatTitle: "Chat",
+          topKLabel: "Sources per answer (k)",
+          answerLangLabel: "Answer language",
+          answerLangAuto: "Auto (UI language)",
+          modelLabel: "Model",
+          saveModelBtn: "Save model",
+          chatHistoryTitle: "Chat history",
+          referenceMentionsTitle: "Mentioned in texts (not curriculum sources)",
+          noReferenceMentions: "No external references mentioned in retrieved text.",
+          chatHistorySub: "(for active course)",
+          questionPlaceholder: "Ask about curriculum, texts, or exercises...",
+          chatBtn: "Ask",
+          newChatBtn: "New chat",
+          instancesTitle: "Create student chat windows",
+          instancesSub: "Publish a locked chatbot for students from the active course.",
+          instanceFieldsHint: "Chat window name is an internal teacher label. Student access password is what students use to log in.",
+          instanceNamePlaceholder: "Chat window name (e.g., Group A Spring 2026)",
+          instanceStudentPromptPlaceholder: "Student prompt (final for this instance)",
+          instancePromptReviewedLabel: "I have reviewed the student prompt before publish",
+          instancePasswordPlaceholder: "Student access password",
+          publishInstanceBtn: "Publish",
+          refreshInstancesBtn: "Refresh chat windows",
+          deleteBtn: "Delete",
+          fullPromptTitle: "Full system prompt (live preview)",
+          fullPromptSub: "Final system prompt received by the model.",
+          working: "Working",
+          thinking: "Thinking",
+          writeQuestionError: "Enter a question.",
+          writeCoursePrompt: "Select or create a course to edit the course prompt.",
+          noMessages: "No messages yet.",
+          sourceLabel: "sources",
+          chunkLabel: "chunks",
+          roundsLabel: "retrieval_round(s)",
+          done: "Done",
+          activeModel: "Active model",
+        },
+      };
+
+      function t(key) {
+        const lang = uiLang === "en" ? "en" : "da";
+        return (I18N[lang] && I18N[lang][key]) || (I18N.da && I18N.da[key]) || key;
+      }
+
+      function applyI18n() {
+        uiLangDaBtn.classList.toggle("active", uiLang === "da");
+        uiLangEnBtn.classList.toggle("active", uiLang === "en");
+        uiLangDaBtn.setAttribute("aria-pressed", uiLang === "da" ? "true" : "false");
+        uiLangEnBtn.setAttribute("aria-pressed", uiLang === "en" ? "true" : "false");
+        answerLangSelect.value = answerLangMode;
+        document.documentElement.lang = uiLang;
+        const byIdText = [
+          ["aboutTitle", "aboutTitle"],
+          ["aboutBody", "aboutBody"],
+          ["coursesTitle", "coursesTitle"],
+          ["coursesSub", "coursesSub"],
+          ["newCourseBtn", "newCourseBtn"],
+          ["courseInfoTitle", "courseInfoTitle"],
+          ["setCourseBtn", "setCourseBtn"],
+          ["refreshCourseBtn", "refreshCourseBtn"],
+          ["promptTitle", "promptTitle"],
+          ["promptSub", "promptSub"],
+          ["savePromptBtn", "savePromptBtn"],
+          ["refreshPromptBtn", "refreshPromptBtn"],
+          ["lockedRulesSummary", "lockedRulesSummary"],
+          ["activePromptSummary", "activePromptSummary"],
+          ["teacherPromptSummary", "teacherPromptSummary"],
+          ["studentPromptSummary", "studentPromptSummary"],
+          ["uploadTitle", "uploadTitle"],
+          ["uploadBtn", "uploadBtn"],
+          ["documentsTitle", "documentsTitle"],
+          ["refreshDocsBtn", "refreshDocsBtn"],
+          ["chatTitle", "chatTitle"],
+          ["topKLabel", "topKLabel"],
+          ["answerLangLabel", "answerLangLabel"],
+          ["modelLabel", "modelLabel"],
+          ["saveModelBtn", "saveModelBtn"],
+          ["chatHistoryTitle", "chatHistoryTitle"],
+          ["referenceMentionsTitle", "referenceMentionsTitle"],
+          ["chatHistorySub", "chatHistorySub"],
+          ["chatBtn", "chatBtn"],
+          ["newChatBtn", "newChatBtn"],
+          ["instancesTitle", "instancesTitle"],
+          ["instancesSub", "instancesSub"],
+          ["instanceFieldsHint", "instanceFieldsHint"],
+          ["instancePromptReviewedLabel", "instancePromptReviewedLabel"],
+          ["publishInstanceBtn", "publishInstanceBtn"],
+          ["refreshInstancesBtn", "refreshInstancesBtn"],
+          ["fullPromptTitle", "fullPromptTitle"],
+          ["fullPromptSub", "fullPromptSub"],
+          ["logoutTopBtn", "logout"],
+          ["loginBtn", "login"],
+          ["answerLangAutoOption", "answerLangAuto"],
+        ];
+        byIdText.forEach(([id, key]) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = t(key);
+        });
+        const loginTitleEl = document.querySelector(".gate-title");
+        if (loginTitleEl) loginTitleEl.textContent = t("loginTitle");
+        const loginSubEl = document.querySelector(".gate-sub");
+        if (loginSubEl) loginSubEl.textContent = t("loginSub");
+        const usernameEl = document.getElementById("username");
+        if (usernameEl) usernameEl.placeholder = t("usernamePlaceholder");
+        const passwordEl = document.getElementById("password");
+        if (passwordEl) passwordEl.placeholder = t("passwordPlaceholder");
+        const cTitle = document.getElementById("courseTitle");
+        if (cTitle) cTitle.placeholder = t("courseTitlePlaceholder");
+        const cDesc = document.getElementById("courseDesc");
+        if (cDesc) cDesc.placeholder = t("courseDescPlaceholder");
+        const pEdit = document.getElementById("promptEditable");
+        if (pEdit) pEdit.placeholder = t("promptPlaceholder");
+        const q = document.getElementById("question");
+        if (q) q.placeholder = t("questionPlaceholder");
+        const iname = document.getElementById("instanceName");
+        if (iname) iname.placeholder = t("instanceNamePlaceholder");
+        const isp = document.getElementById("instanceStudentPrompt");
+        if (isp) isp.placeholder = t("instanceStudentPromptPlaceholder");
+        const ipass = document.getElementById("instancePassword");
+        if (ipass) ipass.placeholder = t("instancePasswordPlaceholder");
+        const tipIcon = document.getElementById("promptTipIcon");
+        if (tipIcon) tipIcon.setAttribute("aria-label", t("promptTipAria"));
+        const tipText = document.getElementById("promptTipText");
+        if (tipText) tipText.textContent = t("promptTipText");
+      }
 
       function escapeHtml(text) {
         const d = document.createElement("div");
@@ -495,6 +810,11 @@ WEB_UI_HTML = """<!doctype html>
         return out.join("");
       }
 
+      function cleanDisplayFilename(name) {
+        const raw = String(name || "");
+        return raw.replace(/^\\d{8}-\\d{6}-/, "");
+      }
+
       function renderGroupedSources(container, data) {
         container.innerHTML = "";
         const grouped = Array.isArray(data?.sources) ? data.sources : [];
@@ -506,7 +826,7 @@ WEB_UI_HTML = """<!doctype html>
             const snippetHtml = snippets.map((sn) => `
               <div style="margin-top:6px;">p${escapeHtml(String(sn.page_start ?? "?"))}: ${escapeHtml(String(sn.content || ""))}</div>
             `).join("");
-            div.innerHTML = `<strong>[${escapeHtml(String(src.ref ?? "?"))}] ${escapeHtml(String(src.filename || "Ukendt kilde"))}</strong>${snippetHtml}`;
+            div.innerHTML = `<strong>[${escapeHtml(String(src.ref ?? "?"))}] ${escapeHtml(cleanDisplayFilename(String(src.filename || "Ukendt kilde")))}</strong>${snippetHtml}`;
             container.appendChild(div);
           });
           return;
@@ -515,7 +835,30 @@ WEB_UI_HTML = """<!doctype html>
         (data?.contexts || []).forEach((ctx) => {
           const div = document.createElement("div");
           div.className = "source";
-          div.innerHTML = `<strong>${escapeHtml(ctx.filename)}</strong> p${escapeHtml(ctx.page_start)}<br>${escapeHtml(ctx.content || "")}`;
+          div.innerHTML = `<strong>${escapeHtml(cleanDisplayFilename(String(ctx.filename || "Ukendt kilde")))}</strong> p${escapeHtml(ctx.page_start)}<br>${escapeHtml(ctx.content || "")}`;
+          container.appendChild(div);
+        });
+      }
+
+      function renderReferenceMentions(container, data) {
+        container.innerHTML = "";
+        const mentions = Array.isArray(data?.reference_mentions) ? data.reference_mentions : [];
+        if (!mentions.length) {
+          container.innerHTML = `<div class="small">${escapeHtml(t("noReferenceMentions"))}</div>`;
+          return;
+        }
+        mentions.forEach((m) => {
+          const div = document.createElement("div");
+          div.className = "source small";
+          const filename = escapeHtml(cleanDisplayFilename(String(m.filename || "Ukendt kilde")));
+          const page = escapeHtml(String(m.page_start ?? "?"));
+          const full = String(m.content || "");
+          const short = full.length > 240 ? `${full.slice(0, 240)}...` : full;
+          div.innerHTML = `
+            <strong>${filename}</strong> p${page}<br>
+            ${escapeHtml(short)}
+            <details><summary>${escapeHtml(uiLang === "en" ? "Show full excerpt" : "Vis hele uddraget")}</summary>${escapeHtml(full)}</details>
+          `;
           container.appendChild(div);
         });
       }
@@ -529,7 +872,7 @@ WEB_UI_HTML = """<!doctype html>
             const wrapper = document.createElement("div");
             wrapper.className = "source small";
             const ref = escapeHtml(String(src.ref ?? "?"));
-            const filename = escapeHtml(String(src.filename || "Ukendt kilde"));
+            const filename = escapeHtml(cleanDisplayFilename(String(src.filename || "Ukendt kilde")));
             const snippets = Array.isArray(src.snippets) ? src.snippets : [];
             const snippetsHtml = snippets.map((sn) => {
               const fullText = String(sn.content || "");
@@ -538,7 +881,7 @@ WEB_UI_HTML = """<!doctype html>
                 <div style="margin-top:6px;">
                   p${escapeHtml(String(sn.page_start ?? "?"))} idx ${escapeHtml(String(sn.chunk_index ?? "?"))}<br>
                   ${escapeHtml(shortText)}
-                  <details><summary>Vis hele uddraget</summary>${escapeHtml(fullText)}</details>
+                  <details><summary>${escapeHtml(uiLang === "en" ? "Show full excerpt" : "Vis hele uddraget")}</summary>${escapeHtml(fullText)}</details>
                 </div>
               `;
             }).join("");
@@ -555,9 +898,9 @@ WEB_UI_HTML = """<!doctype html>
           const fullText = String(ctx.content || "");
           const shortText = fullText.length > maxPreviewChars ? `${fullText.slice(0, maxPreviewChars)}...` : fullText;
           div.innerHTML = `
-            <strong>${escapeHtml(ctx.filename)}</strong> p${escapeHtml(ctx.page_start)} idx ${escapeHtml(ctx.chunk_index)}<br>
+            <strong>${escapeHtml(cleanDisplayFilename(String(ctx.filename || "Ukendt kilde")))}</strong> p${escapeHtml(ctx.page_start)} idx ${escapeHtml(ctx.chunk_index)}<br>
             ${escapeHtml(shortText)}
-            <details><summary>Vis hele uddraget</summary>${escapeHtml(fullText)}</details>
+            <details><summary>${escapeHtml(uiLang === "en" ? "Show full excerpt" : "Vis hele uddraget")}</summary>${escapeHtml(fullText)}</details>
           `;
           container.appendChild(div);
         });
@@ -565,7 +908,7 @@ WEB_UI_HTML = """<!doctype html>
 
       const thinkingIntervals = new Map();
 
-      function startThinking(el, label = "Tænker") {
+      function startThinking(el, label = t("thinking")) {
         stopThinking(el);
         el.innerHTML = `<span class="thinking"><span>${escapeHtml(label)}</span><span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span></span>`;
       }
@@ -578,7 +921,7 @@ WEB_UI_HTML = """<!doctype html>
         }
       }
 
-      function startBusyButton(btn, label = "Arbejder") {
+      function startBusyButton(btn, label = t("working")) {
         const original = btn.textContent || "";
         btn.dataset.originalLabel = original;
         btn.disabled = true;
@@ -596,7 +939,7 @@ WEB_UI_HTML = """<!doctype html>
         if (timer) clearInterval(timer);
         btn.disabled = false;
         btn.classList.remove("busy");
-        btn.textContent = btn.dataset.originalLabel || "Spørg";
+        btn.textContent = btn.dataset.originalLabel || t("chatBtn");
       }
 
       function scanModeLabel(mode) {
@@ -622,17 +965,23 @@ WEB_UI_HTML = """<!doctype html>
       }
 
       function showNoCourseOnboarding() {
-        courseState.innerHTML = '<span class="ok">Du har ikke et aktivt kursus endnu. Opret dit første kursus nedenfor.</span>';
-        promptState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at redigere course prompt.</span>';
-        fullPromptStateEl.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se samlet systemprompt.</span>';
+        courseState.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "You do not have an active course yet. Create your first course below." : "Du har ikke et aktivt kursus endnu. Opret dit første kursus nedenfor.")}</span>`;
+        promptState.innerHTML = `<span class="ok">${escapeHtml(t("writeCoursePrompt"))}</span>`;
+        fullPromptStateEl.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Select or create a course to view the full system prompt." : "Vælg eller opret et kursus for at se samlet systemprompt.")}</span>`;
         fullPromptPreviewEl.textContent = "";
-        docsState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se dokumenter.</span>';
+        docsState.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Select or create a course to view documents." : "Vælg eller opret et kursus for at se dokumenter.")}</span>`;
         docsList.innerHTML = "";
-        chatHistoryEl.innerHTML = '<div class="small">Opret et kursus for at starte chat-historik.</div>';
+        chatHistoryEl.innerHTML = `<div class="small">${escapeHtml(uiLang === "en" ? "Create a course to start chat history." : "Opret et kursus for at starte chat-historik.")}</div>`;
       }
 
       function buildStudentUrl(instanceCode) {
         return `${window.location.origin}/student/i/${instanceCode}`;
+      }
+
+      function selectedAnswerLanguage() {
+        if (answerLangMode === "en") return "en";
+        if (answerLangMode === "da") return "da";
+        return null;
       }
 
       async function copyToClipboard(text) {
@@ -656,8 +1005,10 @@ WEB_UI_HTML = """<!doctype html>
         const isJson = (resp.headers.get("content-type") || "").includes("application/json");
         const data = isJson ? await resp.json() : await resp.text();
         if (!resp.ok) {
-          const detail = typeof data === "object" && data ? (data.detail || JSON.stringify(data)) : data;
-          throw new Error(detail || `HTTP ${resp.status}`);
+          let detail = typeof data === "object" && data ? (data.detail ?? data) : data;
+          if (Array.isArray(detail)) detail = detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join("; ");
+          if (typeof detail === "object" && detail !== null) detail = JSON.stringify(detail);
+          throw new Error(String(detail || `HTTP ${resp.status}`));
         }
         return data;
       }
@@ -709,19 +1060,19 @@ WEB_UI_HTML = """<!doctype html>
           const data = await api("/chat/history?limit=100");
           const items = data.messages || [];
           if (!items.length) {
-            chatHistoryEl.innerHTML = '<div class="small">Ingen beskeder endnu.</div>';
+            chatHistoryEl.innerHTML = `<div class="small">${escapeHtml(t("noMessages"))}</div>`;
             return;
           }
           chatHistoryEl.innerHTML = items.map((m) => `
             <div class="history-item">
               <div class="history-role">${escapeHtml(m.role)}</div>
               <div>${m.role === "assistant" ? markdownToHtml(m.content) : escapeHtml(m.content)}</div>
-              <div class="history-time">${escapeHtml(new Date(m.created_at).toLocaleString("da-DK"))}</div>
+              <div class="history-time">${escapeHtml(new Date(m.created_at).toLocaleString(uiLang === "en" ? "en-US" : "da-DK"))}</div>
             </div>
           `).join("");
         } catch (err) {
           if (isNoCourseError(err.message)) {
-            chatHistoryEl.innerHTML = '<div class="small">Opret et kursus for at starte chat-historik.</div>';
+            chatHistoryEl.innerHTML = `<div class="small">${escapeHtml(uiLang === "en" ? "Create a course to start chat history." : "Opret et kursus for at starte chat-historik.")}</div>`;
           } else {
             chatHistoryEl.innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
           }
@@ -730,21 +1081,27 @@ WEB_UI_HTML = """<!doctype html>
 
       async function refreshPrompt() {
         try {
-          const data = await api("/course/prompt");
+          const data = await api(`/course/prompt?ui_language=${uiLang}`);
           promptEditableEl.value = data.editable_instructions || "";
           promptLockedEl.textContent = data.locked_safety_block || "";
           promptPreviewEl.textContent = data.effective_prompt_preview || "";
           promptTeacherPreviewEl.textContent = data.teacher_prompt_preview || data.effective_prompt_preview || "";
           promptStudentPreviewEl.textContent = data.student_prompt_preview || "";
-          promptState.innerHTML = '<span class="ok">Kursusprompt hentet</span>';
+          if (instanceStudentPromptEl) {
+            instanceStudentPromptEl.value = data.student_prompt_preview || "";
+          }
+          if (instancePromptReviewedEl) instancePromptReviewedEl.checked = false;
+          promptState.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Course prompt loaded" : "Kursusprompt hentet")}</span>`;
           fullPromptPreviewEl.textContent = data.effective_prompt_preview || "";
-          fullPromptStateEl.innerHTML = '<span class="ok">Live preview opdateret.</span>';
+          fullPromptStateEl.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Live preview updated." : "Live preview opdateret.")}</span>`;
         } catch (err) {
           if (isNoCourseError(err.message)) {
-            promptState.innerHTML = '<span class="ok">Vælg eller opret et kursus for at redigere course prompt.</span>';
+            promptState.innerHTML = `<span class="ok">${escapeHtml(t("writeCoursePrompt"))}</span>`;
             promptTeacherPreviewEl.textContent = "";
             promptStudentPreviewEl.textContent = "";
-            fullPromptStateEl.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se samlet systemprompt.</span>';
+            if (instanceStudentPromptEl) instanceStudentPromptEl.value = "";
+            if (instancePromptReviewedEl) instancePromptReviewedEl.checked = false;
+            fullPromptStateEl.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Select or create a course to view the full system prompt." : "Vælg eller opret et kursus for at se samlet systemprompt.")}</span>`;
             fullPromptPreviewEl.textContent = "";
           } else {
             promptState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -755,7 +1112,7 @@ WEB_UI_HTML = """<!doctype html>
 
       async function refreshLiveSystemPromptPreview() {
         try {
-          const data = await api("/course/prompt/preview", {
+          const data = await api(`/course/prompt/preview?ui_language=${uiLang}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -767,13 +1124,19 @@ WEB_UI_HTML = """<!doctype html>
           fullPromptPreviewEl.textContent = data.effective_prompt_preview || "";
           promptTeacherPreviewEl.textContent = data.teacher_prompt_preview || data.effective_prompt_preview || "";
           promptStudentPreviewEl.textContent = data.student_prompt_preview || "";
-          fullPromptStateEl.innerHTML = '<span class="ok">Live preview opdateret.</span>';
+          if (instanceStudentPromptEl) {
+            instanceStudentPromptEl.value = data.student_prompt_preview || "";
+          }
+          if (instancePromptReviewedEl) instancePromptReviewedEl.checked = false;
+          fullPromptStateEl.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Live preview updated." : "Live preview opdateret.")}</span>`;
         } catch (err) {
           if (isNoCourseError(err.message)) {
-            fullPromptStateEl.innerHTML = '<span class="ok">Vælg eller opret et kursus for at se samlet systemprompt.</span>';
+            fullPromptStateEl.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Select or create a course to view the full system prompt." : "Vælg eller opret et kursus for at se samlet systemprompt.")}</span>`;
             fullPromptPreviewEl.textContent = "";
             promptTeacherPreviewEl.textContent = "";
             promptStudentPreviewEl.textContent = "";
+            if (instanceStudentPromptEl) instanceStudentPromptEl.value = "";
+            if (instancePromptReviewedEl) instancePromptReviewedEl.checked = false;
           } else {
             fullPromptStateEl.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
           }
@@ -797,11 +1160,12 @@ WEB_UI_HTML = """<!doctype html>
           instancesList.innerHTML = items.map((i) => `
             <div class="small">
               <strong>${escapeHtml(i.name)}</strong>
-              <div class="mono">kode=${escapeHtml(i.instance_code)} | tekstuddrag=${i.chunk_count} | status=${i.is_active ? "aktiv" : "inaktiv"}</div>
+              <div class="mono">adgangskode=${escapeHtml(i.instance_password_plain || "-")} | tekstuddrag=${i.chunk_count} | status=${i.is_active ? "aktiv" : "inaktiv"}</div>
               <div class="row">
                 <button data-action="copy-invite" data-id="${i.id}" data-code="${escapeHtml(i.instance_code)}">Kopiér link</button>
                 <button data-action="instance-on" data-id="${i.id}">Aktivér</button>
                 <button data-action="instance-off" data-id="${i.id}" class="warn">Deaktivér</button>
+                <button data-action="instance-delete" data-id="${i.id}" class="warn">${escapeHtml(t("deleteBtn"))}</button>
               </div>
             </div>
           `).join("");
@@ -825,9 +1189,9 @@ WEB_UI_HTML = """<!doctype html>
           const finalModels = models.length ? models : fallbackModels;
           const modelLabel = (m) => {
             const key = String(m || "").toLowerCase();
-            if (key.includes("gemma3:12b") || key === "gemma3") return "gemma3:12b (12.2B, 131,072 kontekst, hurtig)";
-            if (key.includes("mistral-nemo")) return "mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)";
-            if (key.includes("qwen2.5:14b")) return "qwen2.5:14b-instruct (14B, stærk ræsonnering, lidt tungere)";
+            if (key.includes("gemma3:12b") || key === "gemma3") return uiLang === "en" ? "gemma3:12b (12.2B, 131,072 context, fast)" : "gemma3:12b (12.2B, 131,072 kontekst, hurtig)";
+            if (key.includes("mistral-nemo")) return uiLang === "en" ? "mistral-nemo (12.2B, 1,024,000 context, strong all-round)" : "mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)";
+            if (key.includes("qwen2.5:14b")) return uiLang === "en" ? "qwen2.5:14b-instruct (14B, strong reasoning, slightly heavier)" : "qwen2.5:14b-instruct (14B, stærk ræsonnering, lidt tungere)";
             return String(m);
           };
           select.innerHTML = finalModels.map((m) => `<option value="${escapeHtml(String(m))}">${escapeHtml(modelLabel(String(m)))}</option>`).join("");
@@ -839,18 +1203,18 @@ WEB_UI_HTML = """<!doctype html>
           } else if (finalModels.length > 0) {
             select.value = String(finalModels[0]);
           }
-          modelState.innerHTML = `<span class="ok">Aktiv model: ${escapeHtml(String(select.value || activeModel || "ukendt"))}</span>`;
+          modelState.innerHTML = `<span class="ok">${escapeHtml(t("activeModel"))}: ${escapeHtml(String(select.value || activeModel || "ukendt"))}</span>`;
         } catch (err) {
           const select = document.getElementById("chatModelSelect");
           const fallbackModels = ["gemma3:12b", "mistral-nemo"];
           select.innerHTML = fallbackModels.map((m) => {
             const label = m.includes("gemma")
-              ? "gemma3:12b (12.2B, 131,072 kontekst, hurtig)"
-              : "mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)";
+              ? (uiLang === "en" ? "gemma3:12b (12.2B, 131,072 context, fast)" : "gemma3:12b (12.2B, 131,072 kontekst, hurtig)")
+              : (uiLang === "en" ? "mistral-nemo (12.2B, 1,024,000 context, strong all-round)" : "mistral-nemo (12.2B, 1,024,000 kontekst, stærk allround)");
             return `<option value="${escapeHtml(String(m))}">${escapeHtml(label)}</option>`;
           }).join("");
           select.value = "gemma3:12b";
-          modelState.innerHTML = `<span class="err">Kunne ikke hente modelstatus (${escapeHtml(err.message)}). Du kan stadig vælge model og prøve at gemme.</span>`;
+          modelState.innerHTML = `<span class="err">${escapeHtml(uiLang === "en" ? `Could not load model status (${err.message}). You can still choose a model and try to save.` : `Kunne ikke hente modelstatus (${err.message}). Du kan stadig vælge model og prøve at gemme.`)}</span>`;
         }
       }
 
@@ -861,7 +1225,7 @@ WEB_UI_HTML = """<!doctype html>
           docsState.innerHTML = `<span class="ok">${items.length} dokument(er)</span>`;
           docsList.innerHTML = items.map((d) => `
             <div class="small">
-              <strong>${escapeHtml(d.filename)}</strong>
+              <strong>${escapeHtml(cleanDisplayFilename(d.filename))}</strong>
               <div class="mono">id=${d.id} | tilstand=${escapeHtml(scanModeLabel(d.scan_mode))} | sprog=${escapeHtml(d.language || "ukendt")} | tekstuddrag=${d.chunk_count}</div>
               <div class="row">
                 <button data-action="reingest-digital" data-id="${d.id}">Genindlæs digitalt</button>
@@ -932,9 +1296,28 @@ WEB_UI_HTML = """<!doctype html>
           await refreshChatHistory();
           await refreshInstances();
           await refreshLiveSystemPromptPreview();
+          applyI18n();
         } catch (err) {
           showGate(err.message);
         }
+      });
+
+      async function setUiLang(nextLang) {
+        uiLang = nextLang === "en" ? "en" : "da";
+        localStorage.setItem("rucai_ui_lang", uiLang);
+        applyI18n();
+        if (!token) return;
+        await refreshPrompt();
+        await refreshLiveSystemPromptPreview();
+        await refreshChatHistory();
+      }
+
+      uiLangDaBtn.addEventListener("click", async () => { await setUiLang("da"); });
+      uiLangEnBtn.addEventListener("click", async () => { await setUiLang("en"); });
+
+      answerLangSelect.addEventListener("change", () => {
+        answerLangMode = answerLangSelect.value;
+        localStorage.setItem("rucai_answer_lang", answerLangMode);
       });
 
       document.getElementById("logoutTopBtn").addEventListener("click", () => {
@@ -980,7 +1363,7 @@ WEB_UI_HTML = """<!doctype html>
       document.getElementById("newCourseBtn").addEventListener("click", () => {
         document.getElementById("courseTitle").value = "";
         document.getElementById("courseDesc").value = "";
-        courseState.innerHTML = '<span class="ok">Udfyld titel og beskrivelse og klik "Placer kursusbeskrivelse og titel i systemprompt".</span>';
+        courseState.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? 'Fill title and description, then click "Place course description and title in system prompt".' : 'Udfyld titel og beskrivelse og klik "Placer kursusbeskrivelse og titel i systemprompt".')}</span>`;
         scheduleLiveSystemPromptPreview();
         document.getElementById("activeCourseCard").scrollIntoView({ behavior: "smooth", block: "start" });
         document.getElementById("courseTitle").focus();
@@ -990,7 +1373,7 @@ WEB_UI_HTML = """<!doctype html>
         try {
           const model = document.getElementById("chatModelSelect").value.trim();
           if (!model) {
-            modelState.innerHTML = '<span class="err">Vælg en model først.</span>';
+            modelState.innerHTML = `<span class="err">${escapeHtml(uiLang === "en" ? "Select a model first." : "Vælg en model først.")}</span>`;
             return;
           }
           const data = await api("/runtime/model", {
@@ -1008,20 +1391,42 @@ WEB_UI_HTML = """<!doctype html>
         try {
           const name = document.getElementById("instanceName").value.trim();
           const instance_password = document.getElementById("instancePassword").value.trim();
-          if (!name || !instance_password) {
-            instancesState.innerHTML = '<span class="err">Navn og adgangskode er påkrævet.</span>';
+          const studentEditable = (instanceStudentPromptEl?.value || "").trim();
+          const reviewed = Boolean(instancePromptReviewedEl?.checked);
+          if (!name) {
+            instancesState.innerHTML = `<span class="err">${escapeHtml(uiLang === "en" ? "Name is required." : "Navn er påkrævet.")}</span>`;
+            return;
+          }
+          if (!studentEditable) {
+            instancesState.innerHTML = `<span class="err">${escapeHtml(uiLang === "en" ? "Student prompt is required." : "Student-prompt er påkrævet.")}</span>`;
+            return;
+          }
+          if (!instance_password) {
+            instancesState.innerHTML = `<span class="err">${escapeHtml(uiLang === "en" ? "Password is required." : "Adgangskode er påkrævet.")}</span>`;
+            return;
+          }
+          if (!reviewed) {
+            instancesState.innerHTML = `<span class="err">${escapeHtml(uiLang === "en" ? "Confirm that you reviewed the student prompt before publish." : "Bekræft at student-prompten er gennemgået før publicering.")}</span>`;
             return;
           }
           const created = await api("/instances", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name, instance_code: null, instance_password }),
+            body: JSON.stringify({
+              name,
+              instance_code: null,
+              instance_password,
+              student_editable_instructions: studentEditable,
+              ui_language: uiLang,
+            }),
           });
           const actualCode = created?.instance?.instance_code || "";
+          const actualPassword = created?.instance?.instance_password_plain || instance_password;
           const studentUrl = buildStudentUrl(actualCode);
           await copyToClipboard(studentUrl);
           document.getElementById("instancePassword").value = "";
-          instancesState.innerHTML = `<span class="ok">Chatvindue publiceret. Kode: <strong>${escapeHtml(actualCode)}</strong>. Link kopieret.</span>`;
+          if (instancePromptReviewedEl) instancePromptReviewedEl.checked = false;
+          instancesState.innerHTML = `<span class="ok">Chatvindue publiceret. Adgangskode: <strong>${escapeHtml(actualPassword)}</strong>. Link kopieret.</span>`;
           await refreshInstances();
         } catch (err) {
           instancesState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -1053,14 +1458,14 @@ WEB_UI_HTML = """<!doctype html>
       document.getElementById("savePromptBtn").addEventListener("click", async () => {
         try {
           const editable_instructions = promptEditableEl.value.trim();
-          const data = await api("/course/prompt", {
+          const data = await api(`/course/prompt?ui_language=${uiLang}`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ editable_instructions }),
           });
           promptLockedEl.textContent = data.locked_safety_block || "";
           promptPreviewEl.textContent = data.effective_prompt_preview || "";
-          promptState.innerHTML = '<span class="ok">Kursusprompt gemt</span>';
+          promptState.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "Course prompt saved" : "Kursusprompt gemt")}</span>`;
           await refreshLiveSystemPromptPreview();
         } catch (err) {
           promptState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -1105,7 +1510,7 @@ WEB_UI_HTML = """<!doctype html>
           ingestState.innerHTML = uploads.map((u) => {
               const failed = u.status.startsWith("failed");
               const cls = failed ? "err" : "ok";
-              return `<div><span class="${cls}">${escapeHtml(u.filename)} (${escapeHtml(u.scan_mode)}): ${escapeHtml(u.status)}</span> <span class="mono">job ${u.job_id}</span></div>`;
+              return `<div><span class="${cls}">${escapeHtml(cleanDisplayFilename(u.filename))} (${escapeHtml(u.scan_mode)}): ${escapeHtml(u.status)}</span> <span class="mono">job ${u.job_id}</span></div>`;
             }).join("");
             if (done === uploads.length) break;
             await new Promise((r) => setTimeout(r, 2000));
@@ -1193,6 +1598,8 @@ WEB_UI_HTML = """<!doctype html>
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ is_active: false }),
             });
+          } else if (action === "instance-delete") {
+            await api(`/instances/${instanceId}`, { method: "DELETE" });
           }
           await refreshInstances();
         } catch (err) {
@@ -1202,26 +1609,35 @@ WEB_UI_HTML = """<!doctype html>
 
       document.getElementById("chatBtn").addEventListener("click", async () => {
         const chatBtn = document.getElementById("chatBtn");
-        const busyTimer = startBusyButton(chatBtn, "Arbejder");
+        const busyTimer = startBusyButton(chatBtn, t("working"));
         try {
           const message = document.getElementById("question").value.trim();
           const k = Number(document.getElementById("topK").value || 5);
           if (!message) {
-            chatStatus.innerHTML = '<span class="err">Skriv et spørgsmål.</span>';
+            chatStatus.innerHTML = `<span class="err">${escapeHtml(t("writeQuestionError"))}</span>`;
             return;
           }
-          startThinking(chatStatus, "Tænker");
+          startThinking(chatStatus, t("thinking"));
           answerEl.innerHTML = "";
           sourcesEl.innerHTML = "";
+          referenceMentionsEl.innerHTML = "";
+          const answerLanguage = selectedAnswerLanguage();
           const data = await api("/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message, k }),
+            body: JSON.stringify({
+              message,
+              k,
+              ui_language: uiLang,
+              answer_language: answerLanguage,
+            }),
           });
           stopThinking(chatStatus);
-          chatStatus.innerHTML = `<span class="ok">Færdig</span> <span class="mono">intent=${escapeHtml(data.intent || "narrow")} | kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0} | retrieval_runde(r)=${data.retrieval_rounds ?? 1}</span>`;
+          chatStatus.innerHTML = `<span class="ok">${escapeHtml(t("done"))}</span> <span class="mono">intent=${escapeHtml(data.intent || "narrow")} | ${escapeHtml(t("sourceLabel"))}=${data.source_count ?? 0} | ${escapeHtml(t("chunkLabel"))}=${data.chunk_count ?? 0} | ${escapeHtml(t("roundsLabel"))}=${data.retrieval_rounds ?? 1}</span>`;
           answerEl.innerHTML = markdownToHtml(data.answer || "");
           renderGroupedSources(sourcesEl, data);
+          renderReferenceMentions(referenceMentionsEl, data);
+          document.getElementById("question").value = "";
           await refreshChatHistory();
         } catch (err) {
           stopThinking(chatStatus);
@@ -1237,7 +1653,8 @@ WEB_UI_HTML = """<!doctype html>
           await api("/chat/history", { method: "DELETE" });
           answerEl.innerHTML = "";
           sourcesEl.innerHTML = "";
-          chatStatus.innerHTML = '<span class="ok">Ny samtale startet.</span>';
+          referenceMentionsEl.innerHTML = "";
+          chatStatus.innerHTML = `<span class="ok">${escapeHtml(uiLang === "en" ? "New chat started." : "Ny samtale startet.")}</span>`;
           await refreshChatHistory();
         } catch (err) {
           chatStatus.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
@@ -1245,6 +1662,7 @@ WEB_UI_HTML = """<!doctype html>
       });
 
       (async () => {
+        applyI18n();
         const valid = await validateSession();
         if (valid) {
           showApp();
@@ -1255,6 +1673,7 @@ WEB_UI_HTML = """<!doctype html>
           await refreshChatHistory();
           await refreshInstances();
           await refreshLiveSystemPromptPreview();
+          applyI18n();
         } else {
           showGate("");
         }
@@ -1270,6 +1689,7 @@ STUDENT_UI_HTML = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>RUCAI Studerende</title>
+    <!-- UMAMI_BOOTSTRAP -->
     <style>
       body { margin: 0; font-family: "Avenir Next", "IBM Plex Sans", sans-serif; background: #f7f5f0; color: #1f1f1d; }
       .wrap { width: min(1200px, 96vw); margin: 24px auto; }
@@ -1308,6 +1728,10 @@ STUDENT_UI_HTML = """<!doctype html>
       .student-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
       .student-head h3 { margin: 0; }
       #studentLogoutBtn { margin-left: auto; }
+      .lang-toggle { display: inline-flex; border: 1px solid #ddd8cf; border-radius: 10px; overflow: hidden; background: #fff; }
+      button.lang-toggle-btn { border: 0; border-radius: 0; padding: 8px 12px; background: #fff !important; color: #1f1f1d !important; font-weight: 700; min-width: 48px; }
+      .lang-toggle-btn + .lang-toggle-btn { border-left: 1px solid #ddd8cf; }
+      button.lang-toggle-btn.active { background: linear-gradient(135deg, #0f8b8d, #0a6f71) !important; color: #fff !important; }
       .thinking { display: inline-flex; align-items: center; gap: 4px; }
       .thinking-dots { display: inline-flex; min-width: 22px; }
       .thinking-dots span { opacity: 0.2; animation: thinkingBlink 1.2s infinite; }
@@ -1329,7 +1753,7 @@ STUDENT_UI_HTML = """<!doctype html>
   <body>
     <div class="wrap">
       <section id="loginCard" class="card">
-        <h2>RUCAI Studerende</h2>
+        <h2 id="studentLoginTitle">RUCAI Studerende</h2>
         <div id="studentLoginHint" class="small">Log ind med adgangskode fra underviserens invitationslink.</div>
         <div class="row">
           <input id="instancePassword" type="password" placeholder="adgangskode" />
@@ -1348,12 +1772,18 @@ STUDENT_UI_HTML = """<!doctype html>
           <section class="card">
             <div class="student-head">
               <h3 id="instanceTitle">Chatvindue</h3>
+              <div class="lang-toggle" role="group" aria-label="Language toggle">
+                <button id="studentUiLangDaBtn" type="button" class="lang-toggle-btn">DA</button>
+                <button id="studentUiLangEnBtn" type="button" class="lang-toggle-btn">EN</button>
+              </div>
               <button id="studentLogoutBtn" class="warn">Log ud</button>
             </div>
             <div id="studentState" class="small"></div>
             <div id="studentAnswer" class="answer"></div>
             <div id="studentSources"></div>
-            <div class="small"><strong>Samtalehistorik</strong></div>
+            <div class="small"><strong id="studentReferenceMentionsTitle">Nævnt i teksterne (ikke pensumkilder)</strong></div>
+            <div id="studentReferenceMentions"></div>
+            <div class="small"><strong id="studentHistoryTitle">Samtalehistorik</strong></div>
             <div id="studentChatHistory" class="history"></div>
             <div class="student-compose">
               <div class="row">
@@ -1361,7 +1791,13 @@ STUDENT_UI_HTML = """<!doctype html>
               </div>
               <div class="row actions">
                 <input id="studentTopK" type="number" min="1" max="50" value="5" />
+                <select id="studentAnswerLangSelect" style="max-width:180px;">
+                  <option value="auto">Auto (UI-sprog)</option>
+                  <option value="da">Dansk</option>
+                  <option value="en">English</option>
+                </select>
                 <button id="studentAskBtn">Spørg</button>
+                <button id="studentNewChatBtn" class="warn">Ny samtale</button>
               </div>
             </div>
           </section>
@@ -1371,6 +1807,9 @@ STUDENT_UI_HTML = """<!doctype html>
 
     <script>
       let token = localStorage.getItem("rucai_student_token") || "";
+      const studentBrowserLang = (navigator.language || "da").toLowerCase().startsWith("da") ? "da" : "en";
+      let studentUiLang = localStorage.getItem("rucai_student_ui_lang") || studentBrowserLang;
+      let studentAnswerLang = localStorage.getItem("rucai_student_answer_lang") || "auto";
       const loginCard = document.getElementById("loginCard");
       const studentCard = document.getElementById("studentCard");
       const loginState = document.getElementById("loginState");
@@ -1379,12 +1818,121 @@ STUDENT_UI_HTML = """<!doctype html>
       const instanceTitle = document.getElementById("instanceTitle");
       const answerEl = document.getElementById("studentAnswer");
       const sourcesEl = document.getElementById("studentSources");
+      const studentReferenceMentionsEl = document.getElementById("studentReferenceMentions");
       const studentChatHistoryEl = document.getElementById("studentChatHistory");
       const studentDocsEl = document.getElementById("studentDocs");
+      const studentUiLangDaBtn = document.getElementById("studentUiLangDaBtn");
+      const studentUiLangEnBtn = document.getElementById("studentUiLangEnBtn");
+      const studentAnswerLangSelect = document.getElementById("studentAnswerLangSelect");
       const pathMatch = window.location.pathname.match(/^\\/student\\/i\\/([^/]+)$/);
       const defaultInstanceCode = pathMatch ? decodeURIComponent(pathMatch[1] || "").toUpperCase() : "";
-      if (!defaultInstanceCode) {
-        loginHint.innerHTML = '<span class="err">Åbn via invitationslink fra underviser.</span>';
+      const STUDENT_I18N = {
+        da: {
+          title: "RUCAI Studerende",
+          loginHint: "Log ind med adgangskode fra underviserens invitationslink.",
+          login: "Log ind",
+          passwordPlaceholder: "adgangskode",
+          invalidInvite: "Åbn via invitationslink fra underviser.",
+          materials: "Materialer",
+          materialsSub: "Tekster i dette chatvindue.",
+          chatWindow: "Chatvindue",
+          logout: "Log ud",
+          history: "Samtalehistorik",
+          referenceMentions: "Nævnt i teksterne (ikke pensumkilder)",
+          noReferenceMentions: "Ingen nævnte eksterne kilder fundet.",
+          askPlaceholder: "Stil et spørgsmål til materialet...",
+          ask: "Spørg",
+          newChat: "Ny samtale",
+          noMessages: "Ingen beskeder endnu.",
+          noDocs: "Ingen dokumenter fundet i denne instance.",
+          noCode: "Invitationslink mangler kode.",
+          fillPassword: "Udfyld password.",
+          loggedIn: "Logget ind.",
+          done: "Færdig",
+          sourceLabel: "kilder",
+          chunkLabel: "uddrag",
+          working: "Arbejder",
+          thinking: "Tænker",
+          writeQuestion: "Skriv et spørgsmål.",
+          autoAnswerLang: "Auto (UI-sprog)",
+        },
+        en: {
+          title: "RUCAI Student",
+          loginHint: "Log in with the password from the teacher invitation link.",
+          login: "Log in",
+          passwordPlaceholder: "password",
+          invalidInvite: "Open via the invitation link from your teacher.",
+          materials: "Materials",
+          materialsSub: "Texts in this chat window.",
+          chatWindow: "Chat window",
+          logout: "Log out",
+          history: "Chat history",
+          referenceMentions: "Mentioned in texts (not curriculum sources)",
+          noReferenceMentions: "No external references mentioned in retrieved text.",
+          askPlaceholder: "Ask a question about the material...",
+          ask: "Ask",
+          newChat: "New chat",
+          noMessages: "No messages yet.",
+          noDocs: "No documents found in this instance.",
+          noCode: "Invitation link is missing code.",
+          fillPassword: "Enter password.",
+          loggedIn: "Logged in.",
+          done: "Done",
+          sourceLabel: "sources",
+          chunkLabel: "chunks",
+          working: "Working",
+          thinking: "Thinking",
+          writeQuestion: "Enter a question.",
+          autoAnswerLang: "Auto (UI language)",
+        },
+      };
+
+      function st(key) {
+        const lang = studentUiLang === "en" ? "en" : "da";
+        return (STUDENT_I18N[lang] && STUDENT_I18N[lang][key]) || (STUDENT_I18N.da && STUDENT_I18N.da[key]) || key;
+      }
+
+      function applyStudentI18n() {
+        document.documentElement.lang = studentUiLang;
+        studentUiLangDaBtn.classList.toggle("active", studentUiLang === "da");
+        studentUiLangEnBtn.classList.toggle("active", studentUiLang === "en");
+        studentUiLangDaBtn.setAttribute("aria-pressed", studentUiLang === "da" ? "true" : "false");
+        studentUiLangEnBtn.setAttribute("aria-pressed", studentUiLang === "en" ? "true" : "false");
+        studentAnswerLangSelect.value = studentAnswerLang;
+        const t = (id, key) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = st(key);
+        };
+        t("studentLoginTitle", "title");
+        t("studentLoginBtn", "login");
+        t("studentLogoutBtn", "logout");
+        t("instanceTitle", "chatWindow");
+        const ip = document.getElementById("instancePassword");
+        if (ip) ip.placeholder = st("passwordPlaceholder");
+        const sq = document.getElementById("studentQuestion");
+        if (sq) sq.placeholder = st("askPlaceholder");
+        const histStrong = document.getElementById("studentHistoryTitle");
+        if (histStrong) histStrong.textContent = st("history");
+        const refStrong = document.getElementById("studentReferenceMentionsTitle");
+        if (refStrong) refStrong.textContent = st("referenceMentions");
+        const materialsH3 = document.querySelector(".student-sidebar h3");
+        if (materialsH3) materialsH3.textContent = st("materials");
+        const materialsSub = document.querySelector(".student-sidebar .small");
+        if (materialsSub) materialsSub.textContent = st("materialsSub");
+        const loginHintEl = document.getElementById("studentLoginHint");
+        if (loginHintEl) {
+          if (defaultInstanceCode) {
+            loginHintEl.textContent = st("loginHint");
+          } else {
+            loginHintEl.innerHTML = `<span class="err">${escapeHtml(st("invalidInvite"))}</span>`;
+          }
+        }
+        const askBtn = document.getElementById("studentAskBtn");
+        if (askBtn) askBtn.textContent = st("ask");
+        const newChatBtn = document.getElementById("studentNewChatBtn");
+        if (newChatBtn) newChatBtn.textContent = st("newChat");
+        const autoOpt = studentAnswerLangSelect.querySelector("option[value='auto']");
+        if (autoOpt) autoOpt.textContent = st("autoAnswerLang");
       }
 
       function escapeHtml(text) {
@@ -1429,7 +1977,7 @@ STUDENT_UI_HTML = """<!doctype html>
         container.innerHTML = "";
         const grouped = Array.isArray(data?.sources) ? data.sources : [];
         if (!grouped.length) {
-          container.innerHTML = '<div class="small">Ingen kilder fundet.</div>';
+          container.innerHTML = `<div class="small">${escapeHtml(studentUiLang === "en" ? "No sources found." : "Ingen kilder fundet.")}</div>`;
           return;
         }
         grouped.forEach((src) => {
@@ -1445,7 +1993,7 @@ STUDENT_UI_HTML = """<!doctype html>
               <div class="source-snippet">
                 <div class="small">Side ${page} · uddrag ${idx}</div>
                 <div>${escapeHtml(short)}</div>
-                <details><summary>Vis hele uddraget</summary>${escapeHtml(full)}</details>
+                <details><summary>${escapeHtml(studentUiLang === "en" ? "Show full excerpt" : "Vis hele uddraget")}</summary>${escapeHtml(full)}</details>
               </div>
             `;
           }).join("");
@@ -1458,9 +2006,32 @@ STUDENT_UI_HTML = """<!doctype html>
       // Backward compatibility for stale cached calls with misspelled name.
       const enderGroupedSources = renderGroupedSources;
 
+      function renderStudentReferenceMentions(container, data) {
+        container.innerHTML = "";
+        const mentions = Array.isArray(data?.reference_mentions) ? data.reference_mentions : [];
+        if (!mentions.length) {
+          container.innerHTML = `<div class="small">${escapeHtml(st("noReferenceMentions"))}</div>`;
+          return;
+        }
+        mentions.forEach((m) => {
+          const div = document.createElement("div");
+          div.className = "source";
+          const filename = escapeHtml(cleanDisplayFilename(String(m.filename || "Ukendt kilde")));
+          const page = escapeHtml(String(m.page_start ?? "?"));
+          const full = String(m.content || "");
+          const short = full.length > 260 ? `${full.slice(0, 260)}...` : full;
+          div.innerHTML = `
+            <div class="small">${filename} · p${page}</div>
+            <div>${escapeHtml(short)}</div>
+            <details><summary>${escapeHtml(studentUiLang === "en" ? "Show full excerpt" : "Vis hele uddraget")}</summary>${escapeHtml(full)}</details>
+          `;
+          container.appendChild(div);
+        });
+      }
+
       const thinkingIntervals = new Map();
 
-      function startThinking(el, label = "Tænker") {
+      function startThinking(el, label = st("thinking")) {
         stopThinking(el);
         el.innerHTML = `<span class="thinking"><span>${escapeHtml(label)}</span><span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span></span>`;
       }
@@ -1473,7 +2044,7 @@ STUDENT_UI_HTML = """<!doctype html>
         }
       }
 
-      function startBusyButton(btn, label = "Arbejder") {
+      function startBusyButton(btn, label = st("working")) {
         const original = btn.textContent || "";
         btn.dataset.originalLabel = original;
         btn.disabled = true;
@@ -1491,7 +2062,13 @@ STUDENT_UI_HTML = """<!doctype html>
         if (timer) clearInterval(timer);
         btn.disabled = false;
         btn.classList.remove("busy");
-        btn.textContent = btn.dataset.originalLabel || "Spørg";
+        btn.textContent = btn.dataset.originalLabel || st("ask");
+      }
+
+      function selectedStudentAnswerLanguage() {
+        if (studentAnswerLang === "en") return "en";
+        if (studentAnswerLang === "da") return "da";
+        return null;
       }
 
       async function api(path, options = {}) {
@@ -1501,8 +2078,10 @@ STUDENT_UI_HTML = """<!doctype html>
         const isJson = (resp.headers.get("content-type") || "").includes("application/json");
         const data = isJson ? await resp.json() : await resp.text();
         if (!resp.ok) {
-          const detail = typeof data === "object" && data ? (data.detail || JSON.stringify(data)) : data;
-          throw new Error(detail || `HTTP ${resp.status}`);
+          let detail = typeof data === "object" && data ? (data.detail ?? data) : data;
+          if (Array.isArray(detail)) detail = detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join("; ");
+          if (typeof detail === "object" && detail !== null) detail = JSON.stringify(detail);
+          throw new Error(String(detail || `HTTP ${resp.status}`));
         }
         return data;
       }
@@ -1510,11 +2089,12 @@ STUDENT_UI_HTML = """<!doctype html>
       async function refreshStudentMeta() {
         try {
           const data = await api("/student/instance");
-          instanceTitle.textContent = data.instance.name || "Chatvindue";
+          instanceTitle.textContent = data.instance.name || st("chatWindow");
           await refreshStudentDocuments();
           await refreshStudentChatHistory();
           loginCard.classList.add("hidden");
           studentCard.classList.remove("hidden");
+          applyStudentI18n();
         } catch (err) {
           token = "";
           localStorage.removeItem("rucai_student_token");
@@ -1529,7 +2109,7 @@ STUDENT_UI_HTML = """<!doctype html>
           const data = await api("/student/documents");
           const docs = data.documents || [];
           if (!docs.length) {
-            studentDocsEl.innerHTML = '<div class="small">Ingen dokumenter fundet i denne instance.</div>';
+            studentDocsEl.innerHTML = `<div class="small">${escapeHtml(st("noDocs"))}</div>`;
             return;
           }
           studentDocsEl.innerHTML = docs.map((d) => `
@@ -1548,14 +2128,14 @@ STUDENT_UI_HTML = """<!doctype html>
           const data = await api("/student/chat/history?limit=100");
           const items = data.messages || [];
           if (!items.length) {
-            studentChatHistoryEl.innerHTML = '<div class="small">Ingen beskeder endnu.</div>';
+            studentChatHistoryEl.innerHTML = `<div class="small">${escapeHtml(st("noMessages"))}</div>`;
             return;
           }
           studentChatHistoryEl.innerHTML = items.map((m) => `
             <div class="history-item">
               <div class="history-role">${escapeHtml(m.role)}</div>
               <div>${m.role === "assistant" ? markdownToHtml(m.content) : escapeHtml(m.content)}</div>
-              <div class="history-time">${escapeHtml(new Date(m.created_at).toLocaleString("da-DK"))}</div>
+              <div class="history-time">${escapeHtml(new Date(m.created_at).toLocaleString(studentUiLang === "en" ? "en-US" : "da-DK"))}</div>
             </div>
           `).join("");
           studentChatHistoryEl.scrollTop = studentChatHistoryEl.scrollHeight;
@@ -1569,11 +2149,11 @@ STUDENT_UI_HTML = """<!doctype html>
           const instance_code = defaultInstanceCode;
           const password = document.getElementById("instancePassword").value.trim();
           if (!instance_code) {
-            loginState.innerHTML = '<span class="err">Invitationslink mangler kode.</span>';
+            loginState.innerHTML = `<span class="err">${escapeHtml(st("noCode"))}</span>`;
             return;
           }
           if (!password) {
-            loginState.innerHTML = '<span class="err">Udfyld password.</span>';
+            loginState.innerHTML = `<span class="err">${escapeHtml(st("fillPassword"))}</span>`;
             return;
           }
           const data = await api("/student/login", {
@@ -1583,11 +2163,29 @@ STUDENT_UI_HTML = """<!doctype html>
           });
           token = data.token;
           localStorage.setItem("rucai_student_token", token);
-          loginState.innerHTML = '<span class="ok">Logget ind.</span>';
+          loginState.innerHTML = `<span class="ok">${escapeHtml(st("loggedIn"))}</span>`;
           await refreshStudentMeta();
         } catch (err) {
           loginState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
         }
+      });
+
+      async function setStudentUiLang(nextLang) {
+        studentUiLang = nextLang === "en" ? "en" : "da";
+        localStorage.setItem("rucai_student_ui_lang", studentUiLang);
+        applyStudentI18n();
+        if (token) {
+          await refreshStudentChatHistory();
+          await refreshStudentDocuments();
+        }
+      }
+
+      studentUiLangDaBtn.addEventListener("click", async () => { await setStudentUiLang("da"); });
+      studentUiLangEnBtn.addEventListener("click", async () => { await setStudentUiLang("en"); });
+
+      studentAnswerLangSelect.addEventListener("change", () => {
+        studentAnswerLang = studentAnswerLangSelect.value;
+        localStorage.setItem("rucai_student_answer_lang", studentAnswerLang);
       });
 
       document.getElementById("studentLogoutBtn").addEventListener("click", () => {
@@ -1601,26 +2199,35 @@ STUDENT_UI_HTML = """<!doctype html>
 
       document.getElementById("studentAskBtn").addEventListener("click", async () => {
         const studentAskBtn = document.getElementById("studentAskBtn");
-        const busyTimer = startBusyButton(studentAskBtn, "Arbejder");
+        const busyTimer = startBusyButton(studentAskBtn, st("working"));
         try {
           const message = document.getElementById("studentQuestion").value.trim();
           const k = Number(document.getElementById("studentTopK").value || 5);
           if (!message) {
-            studentState.innerHTML = '<span class="err">Skriv et spørgsmål.</span>';
+            studentState.innerHTML = `<span class="err">${escapeHtml(st("writeQuestion"))}</span>`;
             return;
           }
-          startThinking(studentState, "Tænker");
+          startThinking(studentState, st("thinking"));
           answerEl.textContent = "";
           sourcesEl.innerHTML = "";
+          studentReferenceMentionsEl.innerHTML = "";
+          const answerLanguage = selectedStudentAnswerLanguage();
           const data = await api("/student/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message, k }),
+            body: JSON.stringify({
+              message,
+              k,
+              ui_language: studentUiLang,
+              answer_language: answerLanguage,
+            }),
           });
           stopThinking(studentState);
-          studentState.innerHTML = `<span class="ok">Færdig</span> <span class="mono">kilder=${data.source_count ?? 0} | uddrag=${data.chunk_count ?? 0}</span>`;
+          studentState.innerHTML = `<span class="ok">${escapeHtml(st("done"))}</span> <span class="mono">${escapeHtml(st("sourceLabel"))}=${data.source_count ?? 0} | ${escapeHtml(st("chunkLabel"))}=${data.chunk_count ?? 0}</span>`;
           answerEl.innerHTML = markdownToHtml(data.answer || "");
           renderGroupedSources(sourcesEl, data);
+          renderStudentReferenceMentions(studentReferenceMentionsEl, data);
+          document.getElementById("studentQuestion").value = "";
           await refreshStudentChatHistory();
         } catch (err) {
           stopThinking(studentState);
@@ -1630,7 +2237,22 @@ STUDENT_UI_HTML = """<!doctype html>
         }
       });
 
+      document.getElementById("studentNewChatBtn").addEventListener("click", async () => {
+        try {
+          await api("/student/chat/history", { method: "DELETE" });
+          document.getElementById("studentQuestion").value = "";
+          answerEl.textContent = "";
+          sourcesEl.innerHTML = "";
+          studentReferenceMentionsEl.innerHTML = "";
+          studentState.innerHTML = `<span class="ok">${escapeHtml(st("newChat"))}</span>`;
+          await refreshStudentChatHistory();
+        } catch (err) {
+          studentState.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+        }
+      });
+
       (async () => {
+        applyStudentI18n();
         if (!token) return;
         await refreshStudentMeta();
       })();
@@ -1653,6 +2275,8 @@ class CourseRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     k: int = Field(default=5, ge=1, le=50)
+    ui_language: Literal["da", "en"] = "da"
+    answer_language: Optional[Literal["da", "en"]] = None
 
 
 class PromptRequest(BaseModel):
@@ -1673,6 +2297,8 @@ class InstanceCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     instance_code: Optional[str] = None
     instance_password: str = Field(min_length=4, max_length=200)
+    student_editable_instructions: Optional[str] = None
+    ui_language: Literal["da", "en"] = "da"
 
 
 class InstanceStatusRequest(BaseModel):
@@ -1687,6 +2313,8 @@ class StudentLoginRequest(BaseModel):
 class StudentChatRequest(BaseModel):
     message: str = Field(min_length=1)
     k: int = Field(default=5, ge=1, le=50)
+    ui_language: Literal["da", "en"] = "da"
+    answer_language: Optional[Literal["da", "en"]] = None
 
 
 class RuntimeModelRequest(BaseModel):
@@ -1707,17 +2335,17 @@ def health() -> dict[str, str]:
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
-    return WEB_UI_HTML
+    return _inject_umami(WEB_UI_HTML)
 
 
 @app.get("/student", response_class=HTMLResponse)
 def student_home() -> str:
-    return STUDENT_UI_HTML
+    return _inject_umami(STUDENT_UI_HTML)
 
 
 @app.get("/student/i/{instance_code}", response_class=HTMLResponse)
 def student_home_instance(instance_code: str) -> str:
-    return STUDENT_UI_HTML
+    return _inject_umami(STUDENT_UI_HTML)
 
 
 def _runtime_model_options(settings: object) -> list[str]:
@@ -1728,6 +2356,68 @@ def _runtime_model_options(settings: object) -> list[str]:
     if active and active not in options:
         options.insert(0, active)
     return options
+
+
+def _effective_language(ui_language: Optional[str], answer_language: Optional[str]) -> Literal["da", "en"]:
+    if answer_language in {"da", "en"}:
+        return "en" if answer_language == "en" else "da"
+    if ui_language in {"da", "en"}:
+        return "en" if ui_language == "en" else "da"
+    return "da"
+
+
+def _normalize_language(language: Optional[str]) -> Literal["da", "en"]:
+    return "en" if language == "en" else "da"
+
+
+def _detect_message_language(message: str) -> Optional[Literal["da", "en"]]:
+    text = " " + " ".join((message or "").lower().split()) + " "
+    if not text.strip():
+        return None
+
+    # Strong Danish signals first.
+    if any(ch in text for ch in ["æ", "ø", "å"]):
+        return "da"
+
+    da_markers = [
+        " hvad ",
+        " hvordan ",
+        " hvorfor ",
+        " siger ",
+        " er ",
+        " ikke ",
+        " og ",
+        " i ",
+        " på ",
+        " med ",
+        " tekst ",
+        " teksten ",
+        " pensum ",
+    ]
+    en_markers = [
+        " what ",
+        " how ",
+        " why ",
+        " is ",
+        " not ",
+        " and ",
+        " in ",
+        " with ",
+        " text ",
+        " curriculum ",
+    ]
+    da_hits = sum(1 for m in da_markers if m in text)
+    en_hits = sum(1 for m in en_markers if m in text)
+    # Short-question fallback: choose strongest side even with one clear marker.
+    if da_hits >= 1 and en_hits == 0:
+        return "da"
+    if en_hits >= 1 and da_hits == 0:
+        return "en"
+    if da_hits >= en_hits + 1 and da_hits >= 2:
+        return "da"
+    if en_hits >= da_hits + 1 and en_hits >= 2:
+        return "en"
+    return None
 
 
 @app.get("/runtime/model")
@@ -1773,18 +2463,23 @@ def login(req: LoginRequest) -> dict[str, str]:
 @app.post("/instances")
 def publish_instance(req: InstanceCreateRequest, username: str = Depends(require_auth)) -> dict[str, object]:
     settings = load_settings()
+    language = _normalize_language(req.ui_language)
     course = _active_course_for_request(username)
     course_id = int(course["id"])
     code = _normalize_instance_code(req.instance_code)
 
     with get_connection(settings) as conn:
         teacher_editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
-        student_editable = to_student_editable_instructions(teacher_editable)
+        student_editable = (
+            (req.student_editable_instructions or "").strip()
+            or to_student_editable_instructions(teacher_editable, language=language)
+        )
         effective_prompt = compose_system_prompt(
             student_editable,
             course_title=str(course.get("title") or ""),
             course_description=str(course.get("description") or ""),
             audience="student",
+            language=language,
         )
         chosen_code = code
         created = None
@@ -1799,6 +2494,7 @@ def publish_instance(req: InstanceCreateRequest, username: str = Depends(require
                     name=req.name.strip(),
                     instance_code=chosen_code,
                     password_hash=hash_password(req.instance_password),
+                    instance_password_plain=req.instance_password,
                     editable_instructions_snapshot=student_editable,
                     locked_safety_block_snapshot=LOCKED_SAFETY_BLOCK,
                     effective_system_prompt_snapshot=effective_prompt,
@@ -1848,6 +2544,17 @@ def update_instance_status(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance not found.")
         conn.commit()
     return {"instance": item}
+
+
+@app.delete("/instances/{instance_id}")
+def remove_instance(instance_id: int, username: str = Depends(require_auth)) -> dict[str, object]:
+    settings = load_settings()
+    with get_connection(settings) as conn:
+        deleted = delete_bot_instance(conn, instance_id, username)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance not found.")
+        conn.commit()
+    return {"ok": True, "instance_id": instance_id}
 
 
 @app.post("/student/login")
@@ -1915,27 +2622,89 @@ def student_chat_history(
     return {"instance_id": instance_id, "messages": messages}
 
 
+@app.delete("/student/chat/history")
+def clear_student_chat_history(instance_id: int = Depends(require_student_auth)) -> dict[str, object]:
+    settings = load_settings()
+    with get_connection(settings) as conn:
+        item = get_bot_instance_by_id(conn, instance_id)
+        if not item or not item.get("is_active"):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
+        deleted = delete_student_chat_messages_for_instance(conn, instance_id)
+        conn.commit()
+    return {"instance_id": instance_id, "deleted_count": deleted}
+
+
 @app.post("/student/chat")
 def student_chat(req: StudentChatRequest, instance_id: int = Depends(require_student_auth)) -> dict[str, object]:
     settings = load_settings()
+    language = _effective_language(req.ui_language, req.answer_language)
+    # In auto mode, prefer the language detected from the student's message.
+    if req.answer_language is None:
+        detected = _detect_message_language(req.message)
+        if detected in {"da", "en"}:
+            language = detected
     with get_connection(settings) as conn:
         instance = get_bot_instance_by_id(conn, instance_id)
         if not instance or not instance.get("is_active"):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Student session expired or invalid.")
 
         history = list_student_chat_messages_for_instance(conn, instance_id, limit=20)
-        contexts = search_instance_chunks(req.message, settings, req.k, instance_id)
-        sources = build_grouped_sources(contexts, max_snippets_per_source=1)
         system_prompt = str(instance["effective_system_prompt_snapshot"])
-        if not contexts:
-            answer = (
-                "Jeg kan ikke svare fagligt sikkert ud fra det publicerede materiale. "
-                "Prøv at omformulere spørgsmålet."
-            )
-            prompt = _build_student_prompt(req.message, sources, system_prompt, history)
+        requested_sources = max(1, int(req.k))
+        if _is_teacher_facing_student_query(req.message):
+            contexts = []
+            sources = []
+            reference_mentions = []
+            answer = _student_scope_redirect_answer(language)
+            prompt = _build_student_prompt(req.message, sources, system_prompt, history, language=language)
         else:
-            prompt = _build_student_prompt(req.message, sources, system_prompt, history)
-            answer = generate_answer(prompt, settings)
+            raw_contexts = search_instance_chunks(
+                req.message,
+                settings,
+                max(requested_sources * 4, 12),
+                instance_id,
+                include_reference_chunks=False,
+            )
+            explicit_doc_tokens = sorted(query_document_tokens(req.message))
+            explicit_doc_hint = has_explicit_document_hint(req.message)
+            if explicit_doc_hint and explicit_doc_tokens and not contexts_match_query_document_hint(req.message, raw_contexts):
+                targeted_raw = search_instance_chunks(
+                    req.message,
+                    settings,
+                    max(requested_sources * 5, 14),
+                    instance_id,
+                    include_reference_chunks=False,
+                    filename_tokens=explicit_doc_tokens,
+                )
+                if targeted_raw:
+                    raw_contexts = targeted_raw
+            raw_reference_contexts = search_instance_chunks(
+                req.message,
+                settings,
+                min(max(requested_sources * 2, 4), 12),
+                instance_id,
+                include_reference_chunks=True,
+            )
+            contexts = select_source_first_contexts(
+                raw_contexts,
+                target_sources=requested_sources,
+                max_chunks_per_source=3,
+            )
+            contexts = filter_reference_noise(contexts)
+            contexts = filter_contexts_for_explicit_doc_mention(req.message, contexts)
+            reference_mentions = _student_reference_mentions(raw_reference_contexts, limit=8)
+            sources = build_grouped_sources(contexts, max_snippets_per_source=3)
+            if not contexts:
+                answer = (
+                    "I cannot answer confidently from the published material. Please rephrase the question."
+                    if language == "en"
+                    else "Jeg kan ikke svare fagligt sikkert ud fra det publicerede materiale. "
+                    "Prøv at omformulere spørgsmålet."
+                )
+                prompt = _build_student_prompt(req.message, sources, system_prompt, history, language=language)
+            else:
+                prompt = _build_student_prompt(req.message, sources, system_prompt, history, language=language)
+                answer = generate_answer(prompt, settings)
         insert_student_chat_message(conn, instance_id, "user", req.message)
         insert_student_chat_message(conn, instance_id, "assistant", str(answer))
         conn.commit()
@@ -1954,13 +2723,14 @@ def student_chat(req: StudentChatRequest, instance_id: int = Depends(require_stu
     return {
         "instance_id": instance_id,
         "query": req.message,
-        "k": req.k,
+        "k": requested_sources,
         "answer": answer,
         "contexts": contexts,
         "sources": sources,
         "citations": citations,
         "source_count": len(sources),
         "chunk_count": len(contexts),
+        "reference_mentions": reference_mentions,
         "prompt": prompt,
     }
 
@@ -2010,28 +2780,34 @@ def read_active_course(username: str = Depends(require_auth)) -> dict[str, objec
 
 
 @app.get("/course/prompt")
-def read_course_prompt(username: str = Depends(require_auth)) -> dict[str, str]:
+def read_course_prompt(
+    ui_language: Literal["da", "en"] = Query(default="da"),
+    username: str = Depends(require_auth),
+) -> dict[str, str]:
     settings = load_settings()
+    language = _normalize_language(ui_language)
     course = _active_course_for_request(username)
     course_id = int(course["id"])
     with get_connection(settings) as conn:
         editable = get_course_prompt(conn, course_id) or DEFAULT_EDITABLE_INSTRUCTIONS
-    student_editable = to_student_editable_instructions(editable)
+    student_editable = to_student_editable_instructions(editable, language=language)
     teacher_preview = compose_system_prompt(
         editable,
         course_title=str(course.get("title") or ""),
         course_description=str(course.get("description") or ""),
         audience="teacher",
+        language=language,
     )
     student_preview = compose_system_prompt(
         student_editable,
         course_title=str(course.get("title") or ""),
         course_description=str(course.get("description") or ""),
         audience="student",
+        language=language,
     )
     return {
         "editable_instructions": editable,
-        "locked_safety_block": LOCKED_SAFETY_BLOCK,
+        "locked_safety_block": LOCKED_SAFETY_BLOCK_EN if language == "en" else LOCKED_SAFETY_BLOCK_DA,
         "effective_prompt_preview": teacher_preview,
         "teacher_prompt_preview": teacher_preview,
         "student_prompt_preview": student_preview,
@@ -2039,29 +2815,36 @@ def read_course_prompt(username: str = Depends(require_auth)) -> dict[str, str]:
 
 
 @app.put("/course/prompt")
-def update_course_prompt(req: PromptRequest, username: str = Depends(require_auth)) -> dict[str, str]:
+def update_course_prompt(
+    req: PromptRequest,
+    ui_language: Literal["da", "en"] = Query(default="da"),
+    username: str = Depends(require_auth),
+) -> dict[str, str]:
     settings = load_settings()
+    language = _normalize_language(ui_language)
     course = _active_course_for_request(username)
     course_id = int(course["id"])
     with get_connection(settings) as conn:
         upsert_course_prompt(conn, course_id, req.editable_instructions)
         conn.commit()
-    student_editable = to_student_editable_instructions(req.editable_instructions)
+    student_editable = to_student_editable_instructions(req.editable_instructions, language=language)
     teacher_preview = compose_system_prompt(
         req.editable_instructions,
         course_title=str(course.get("title") or ""),
         course_description=str(course.get("description") or ""),
         audience="teacher",
+        language=language,
     )
     student_preview = compose_system_prompt(
         student_editable,
         course_title=str(course.get("title") or ""),
         course_description=str(course.get("description") or ""),
         audience="student",
+        language=language,
     )
     return {
         "editable_instructions": req.editable_instructions,
-        "locked_safety_block": LOCKED_SAFETY_BLOCK,
+        "locked_safety_block": LOCKED_SAFETY_BLOCK_EN if language == "en" else LOCKED_SAFETY_BLOCK_DA,
         "effective_prompt_preview": teacher_preview,
         "teacher_prompt_preview": teacher_preview,
         "student_prompt_preview": student_preview,
@@ -2069,8 +2852,13 @@ def update_course_prompt(req: PromptRequest, username: str = Depends(require_aut
 
 
 @app.post("/course/prompt/preview")
-def preview_course_prompt(req: PromptPreviewRequest, username: str = Depends(require_auth)) -> dict[str, str]:
+def preview_course_prompt(
+    req: PromptPreviewRequest,
+    ui_language: Literal["da", "en"] = Query(default="da"),
+    username: str = Depends(require_auth),
+) -> dict[str, str]:
     settings = load_settings()
+    language = _normalize_language(ui_language)
     course = _active_course_for_request(username)
     course_id = int(course["id"])
     with get_connection(settings) as conn:
@@ -2082,22 +2870,24 @@ def preview_course_prompt(req: PromptPreviewRequest, username: str = Depends(req
         req.course_description if req.course_description is not None else str(course.get("description") or "")
     )
 
-    student_editable = to_student_editable_instructions(editable)
+    student_editable = to_student_editable_instructions(editable, language=language)
     teacher_preview = compose_system_prompt(
         editable,
         course_title=title,
         course_description=description,
         audience="teacher",
+        language=language,
     )
     student_preview = compose_system_prompt(
         student_editable,
         course_title=title,
         course_description=description,
         audience="student",
+        language=language,
     )
     return {
         "editable_instructions": editable,
-        "locked_safety_block": LOCKED_SAFETY_BLOCK,
+        "locked_safety_block": LOCKED_SAFETY_BLOCK_EN if language == "en" else LOCKED_SAFETY_BLOCK_DA,
         "effective_prompt_preview": teacher_preview,
         "teacher_prompt_preview": teacher_preview,
         "student_prompt_preview": student_preview,
@@ -2221,23 +3011,96 @@ def _build_student_prompt(
     sources: List[dict[str, object]],
     system_prompt: str,
     history: List[dict[str, object]],
+    language: Literal["da", "en"] = "da",
 ) -> str:
     blocks: List[str] = []
+    allowed_sources: List[str] = []
     for source in sources:
         ref = int(source.get("ref") or 0)
+        allowed_sources.append(f"[{ref}] {source.get('filename')}")
         for snippet in source.get("snippets") or []:
             blocks.append(f"[{ref}] {snippet.get('filename')} p{snippet.get('page_start')}\n{snippet.get('content')}")
     context_text = "\n\n".join(blocks)
     history_text = _format_student_history(history)
+    final_instruction = (
+        "\n\nWrite the answer in English with clear source citations [1], [2]. "
+        "If multiple excerpts come from the same document, use the same [n]. "
+        "Use ONLY the allowed uploaded sources listed under ALLOWED SOURCES. "
+        "Do NOT introduce external literature, author-year references, DOI citations, or a separate bibliography section."
+        if language == "en"
+        else "\n\nSkriv et svar med tydelige kildehenvisninger [1], [2]. "
+        "Hvis flere tekstuddrag kommer fra samme dokument, brug samme [n]. "
+        "Brug KUN de tilladte uploadede kilder under TILLADTE KILDER. "
+        "Indfør ikke ekstern litteratur, forfatter-år referencer, DOI-citater eller en separat bibliografi."
+    )
     return (
         system_prompt
         + "\n\nSAMTALEHISTORIK:\n"
         + history_text
+        + "\n\nTILLADTE KILDER:\n"
+        + ("\n".join(allowed_sources) if allowed_sources else "(ingen)")
         + "\n\nKILDER:\n"
         + context_text
         + "\n\nBRUGERSPØRGSMÅL:\n"
         + query
-        + "\n\nSkriv et svar med tydelige kildehenvisninger [1], [2]. Hvis flere tekstuddrag kommer fra samme dokument, brug samme [n]."
+        + final_instruction
+    )
+
+
+def _student_reference_mentions(contexts: List[dict[str, object]], limit: int = 8) -> List[dict[str, object]]:
+    grouped = build_grouped_sources(contexts, max_snippets_per_source=2)
+    out: List[dict[str, object]] = []
+    for source in grouped:
+        for snippet in source.get("snippets") or []:
+            if len(out) >= max(1, limit):
+                return out
+            out.append(
+                {
+                    "ref": source.get("ref"),
+                    "filename": source.get("filename"),
+                    "page_start": snippet.get("page_start"),
+                    "content": snippet.get("content"),
+                }
+            )
+    return out
+
+
+_TEACHER_FACING_MARKERS = {
+    "undervisningsplan",
+    "lektionsplan",
+    "didaktik",
+    "didaktisk",
+    "læringsmål for undervisning",
+    "planlæg et forløb",
+    "design en øvelse til klassen",
+    "teaching plan",
+    "lesson plan",
+    "didactic",
+    "design classroom exercise",
+    "for teachers",
+}
+
+
+def _is_teacher_facing_student_query(query: str) -> bool:
+    q = " ".join((query or "").lower().split())
+    if not q:
+        return False
+    return any(marker in q for marker in _TEACHER_FACING_MARKERS)
+
+
+def _student_scope_redirect_answer(language: Literal["da", "en"]) -> str:
+    if language == "en":
+        return (
+            "This student chat is limited to student support in the published course material. "
+            "I cannot provide teacher-facing didactic planning or classroom design. "
+            "I can instead help you understand concepts, summarize texts, compare arguments, "
+            "or suggest student-facing study questions based on the material."
+        )
+    return (
+        "Dette student-chatvindue er afgrænset til studiestøtte i det publicerede materiale. "
+        "Jeg kan ikke give lærerrettet didaktisk planlægning eller undervisningsdesign. "
+        "Jeg kan i stedet hjælpe med begrebsforståelse, opsummering, sammenligning af argumenter "
+        "eller forslag til studentervendte studiespørgsmål baseret på materialet."
     )
 
 
@@ -2421,6 +3284,7 @@ def clear_chat_history(username: str = Depends(require_auth)) -> dict[str, objec
 @app.post("/chat")
 def chat(req: ChatRequest, username: str = Depends(require_auth)) -> dict[str, object]:
     settings = load_settings()
+    language = _effective_language(req.ui_language, req.answer_language)
     course = _active_course_for_request(username)
     course_id = int(course["id"])
     with get_connection(settings) as conn:
@@ -2439,6 +3303,7 @@ def chat(req: ChatRequest, username: str = Depends(require_auth)) -> dict[str, o
             course_title=str(course.get("title") or ""),
             course_description=str(course.get("description") or ""),
             history=history,
+            language=language,
         )
     except TypeError:
         response = chat_response(
@@ -2447,6 +3312,7 @@ def chat(req: ChatRequest, username: str = Depends(require_auth)) -> dict[str, o
             req.k,
             course_id,
             editable_instructions=editable,
+            language=language,
         )
     response["course_id"] = course_id
     with get_connection(settings) as conn:

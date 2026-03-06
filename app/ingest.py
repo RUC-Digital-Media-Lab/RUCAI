@@ -13,6 +13,7 @@ from pypdf import PdfReader
 
 from .chunking import chunk_text, iter_nonempty, normalize_text
 from .config import Settings
+from .content_roles import classify_chunk_role
 from .db import (
     clear_chunks,
     get_connection,
@@ -175,6 +176,7 @@ def ingest_pdf(
                     page_start=page_number,
                     page_end=page_number,
                     section_title=None,
+                    chunk_role=classify_chunk_role(chunk),
                     content=chunk,
                     embedding=embedding,
                 )
@@ -203,6 +205,7 @@ def ingest_pdf(
                         page_start=1,
                         page_end=1,
                         section_title="mineru_fallback",
+                        chunk_role=classify_chunk_role(chunk),
                         content=chunk,
                         embedding=embedding,
                     )
@@ -263,6 +266,7 @@ def ingest_docx(
                     page_start=idx,
                     page_end=idx,
                     section_title=None,
+                    chunk_role=classify_chunk_role(chunk),
                     content=chunk,
                     embedding=embedding,
                 )

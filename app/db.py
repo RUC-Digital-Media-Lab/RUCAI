@@ -131,6 +131,7 @@ def ensure_schema(settings: Settings) -> None:
                     page_start INTEGER,
                     page_end INTEGER,
                     section_title TEXT,
+                    chunk_role TEXT NOT NULL DEFAULT 'content',
                     content TEXT NOT NULL,
                     embedding vector,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -139,8 +140,56 @@ def ensure_schema(settings: Settings) -> None:
             )
             cur.execute(
                 """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'chunks'
+                      AND column_name = 'chunk_role'
+                );
+                """
+            )
+            has_chunk_role = cur.fetchone()[0]
+            if not has_chunk_role:
+                cur.execute("ALTER TABLE chunks ADD COLUMN chunk_role TEXT DEFAULT 'content';")
+            cur.execute("UPDATE chunks SET chunk_role = 'content' WHERE chunk_role IS NULL OR chunk_role = '';")
+            cur.execute("ALTER TABLE chunks ALTER COLUMN chunk_role SET NOT NULL;")
+            cur.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_chunks_document_id
                 ON chunks(document_id);
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chunks_document_role
+                ON chunks(document_id, chunk_role);
+                """
+            )
+            # Backfill likely bibliography/reference chunks on existing data.
+            cur.execute(
+                """
+                UPDATE chunks
+                SET chunk_role = 'reference'
+                WHERE chunk_role <> 'reference'
+                  AND (
+                    content ~* '(references|bibliography|acknowledgements|declaration of conflicting interests|litteratur|referencer|kildeliste|works cited)'
+                    OR content ~* '\\mdoi[:[:space:]]'
+                    OR content ~* '\\([12][0-9]{3}\\).+\\([12][0-9]{3}\\)'
+                  );
+                """
+            )
+            # Revert over-classification from older heuristics.
+            cur.execute(
+                """
+                UPDATE chunks
+                SET chunk_role = 'content'
+                WHERE chunk_role = 'reference'
+                  AND NOT (
+                    content ~* '(references|bibliography|acknowledgements|declaration of conflicting interests|litteratur|referencer|kildeliste|works cited)'
+                    OR content ~* '\\mdoi[:[:space:]]'
+                    OR content ~* '\\([12][0-9]{3}\\).+\\([12][0-9]{3}\\)'
+                    OR content ~ ';.*;.*;'
+                  );
                 """
             )
 
@@ -186,6 +235,7 @@ def ensure_schema(settings: Settings) -> None:
                     name TEXT NOT NULL,
                     instance_code TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
+                    instance_password_plain TEXT,
                     is_active BOOLEAN NOT NULL DEFAULT TRUE,
                     editable_instructions_snapshot TEXT NOT NULL,
                     locked_safety_block_snapshot TEXT NOT NULL,
@@ -195,6 +245,24 @@ def ensure_schema(settings: Settings) -> None:
                 );
                 """
             )
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'bot_instances'
+                      AND column_name = 'instance_password_plain'
+                );
+                """
+            )
+            has_instance_password_plain = cur.fetchone()[0]
+            if not has_instance_password_plain:
+                cur.execute(
+                    """
+                    ALTER TABLE bot_instances
+                    ADD COLUMN instance_password_plain TEXT;
+                    """
+                )
             cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_bot_instances_owner
@@ -227,6 +295,7 @@ def ensure_schema(settings: Settings) -> None:
                     filename TEXT NOT NULL,
                     page_start INTEGER,
                     chunk_index INTEGER,
+                    chunk_role TEXT NOT NULL DEFAULT 'content',
                     content TEXT NOT NULL,
                     embedding vector,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -235,8 +304,63 @@ def ensure_schema(settings: Settings) -> None:
             )
             cur.execute(
                 """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'bot_instance_chunks'
+                      AND column_name = 'chunk_role'
+                );
+                """
+            )
+            has_instance_chunk_role = cur.fetchone()[0]
+            if not has_instance_chunk_role:
+                cur.execute(
+                    "ALTER TABLE bot_instance_chunks ADD COLUMN chunk_role TEXT DEFAULT 'content';"
+                )
+            cur.execute(
+                """
+                UPDATE bot_instance_chunks
+                SET chunk_role = 'content'
+                WHERE chunk_role IS NULL OR chunk_role = '';
+                """
+            )
+            cur.execute("ALTER TABLE bot_instance_chunks ALTER COLUMN chunk_role SET NOT NULL;")
+            cur.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_bot_instance_chunks_instance_id
                 ON bot_instance_chunks(instance_id);
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bot_instance_chunks_role
+                ON bot_instance_chunks(instance_id, chunk_role);
+                """
+            )
+            cur.execute(
+                """
+                UPDATE bot_instance_chunks
+                SET chunk_role = 'reference'
+                WHERE chunk_role <> 'reference'
+                  AND (
+                    content ~* '(references|bibliography|acknowledgements|declaration of conflicting interests|litteratur|referencer|kildeliste|works cited)'
+                    OR content ~* '\\mdoi[:[:space:]]'
+                    OR content ~* '\\([12][0-9]{3}\\).+\\([12][0-9]{3}\\)'
+                    OR content ~ ';.*;.*;'
+                  );
+                """
+            )
+            cur.execute(
+                """
+                UPDATE bot_instance_chunks
+                SET chunk_role = 'content'
+                WHERE chunk_role = 'reference'
+                  AND NOT (
+                    content ~* '(references|bibliography|acknowledgements|declaration of conflicting interests|litteratur|referencer|kildeliste|works cited)'
+                    OR content ~* '\\mdoi[:[:space:]]'
+                    OR content ~* '\\([12][0-9]{3}\\).+\\([12][0-9]{3}\\)'
+                    OR content ~ ';.*;.*;'
+                  );
                 """
             )
             cur.execute(
@@ -619,6 +743,7 @@ def insert_chunk(
     page_start: int,
     page_end: int,
     section_title: Optional[str],
+    chunk_role: str,
     content: str,
     embedding: Optional[list[float]],
 ) -> None:
@@ -631,9 +756,10 @@ def insert_chunk(
                 page_start,
                 page_end,
                 section_title,
+                chunk_role,
                 content,
                 embedding
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s);
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
             """,
             (
                 document_id,
@@ -641,6 +767,7 @@ def insert_chunk(
                 page_start,
                 page_end,
                 section_title,
+                chunk_role,
                 content,
                 embedding,
             ),
@@ -828,6 +955,20 @@ def list_student_chat_messages_for_instance(
     ]
 
 
+def delete_student_chat_messages_for_instance(conn: psycopg.Connection, instance_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM student_chat_messages
+            WHERE instance_id = %s
+            RETURNING id;
+            """,
+            (instance_id,),
+        )
+        rows = cur.fetchall()
+    return len(rows)
+
+
 def create_bot_instance(
     conn: psycopg.Connection,
     owner_username: str,
@@ -835,6 +976,7 @@ def create_bot_instance(
     name: str,
     instance_code: str,
     password_hash: str,
+    instance_password_plain: str,
     editable_instructions_snapshot: str,
     locked_safety_block_snapshot: str,
     effective_system_prompt_snapshot: str,
@@ -848,13 +990,14 @@ def create_bot_instance(
                 name,
                 instance_code,
                 password_hash,
+                instance_password_plain,
                 is_active,
                 editable_instructions_snapshot,
                 locked_safety_block_snapshot,
                 effective_system_prompt_snapshot
             )
-            VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
-            RETURNING id, owner_username, source_course_id, name, instance_code, is_active, created_at, published_at;
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s)
+            RETURNING id, owner_username, source_course_id, name, instance_code, instance_password_plain, is_active, created_at, published_at;
             """,
             (
                 owner_username,
@@ -862,6 +1005,7 @@ def create_bot_instance(
                 name,
                 instance_code,
                 password_hash,
+                instance_password_plain,
                 editable_instructions_snapshot,
                 locked_safety_block_snapshot,
                 effective_system_prompt_snapshot,
@@ -874,9 +1018,10 @@ def create_bot_instance(
         "source_course_id": row[2],
         "name": row[3],
         "instance_code": row[4],
-        "is_active": row[5],
-        "created_at": row[6].isoformat() if isinstance(row[6], datetime) else row[6],
-        "published_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
+        "instance_password_plain": row[5],
+        "is_active": row[6],
+        "created_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
+        "published_at": row[8].isoformat() if isinstance(row[8], datetime) else row[8],
     }
 
 
@@ -894,6 +1039,7 @@ def copy_course_chunks_to_instance(
                 filename,
                 page_start,
                 chunk_index,
+                chunk_role,
                 content,
                 embedding
             )
@@ -903,6 +1049,7 @@ def copy_course_chunks_to_instance(
                 d.filename,
                 c.page_start,
                 c.chunk_index,
+                c.chunk_role,
                 c.content,
                 c.embedding
             FROM chunks c
@@ -926,6 +1073,7 @@ def list_bot_instances_for_owner(conn: psycopg.Connection, owner_username: str) 
                 i.source_course_id,
                 i.name,
                 i.instance_code,
+                i.instance_password_plain,
                 i.is_active,
                 i.created_at,
                 i.published_at,
@@ -950,10 +1098,11 @@ def list_bot_instances_for_owner(conn: psycopg.Connection, owner_username: str) 
             "source_course_id": row[2],
             "name": row[3],
             "instance_code": row[4],
-            "is_active": row[5],
-            "created_at": row[6].isoformat() if isinstance(row[6], datetime) else row[6],
-            "published_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
-            "chunk_count": row[8],
+            "instance_password_plain": row[5],
+            "is_active": row[6],
+            "created_at": row[7].isoformat() if isinstance(row[7], datetime) else row[7],
+            "published_at": row[8].isoformat() if isinstance(row[8], datetime) else row[8],
+            "chunk_count": row[9],
         }
         for row in rows
     ]
@@ -974,6 +1123,7 @@ def get_bot_instance_for_owner(
                 i.name,
                 i.instance_code,
                 i.password_hash,
+                i.instance_password_plain,
                 i.is_active,
                 i.editable_instructions_snapshot,
                 i.locked_safety_block_snapshot,
@@ -1003,13 +1153,14 @@ def get_bot_instance_for_owner(
         "name": row[3],
         "instance_code": row[4],
         "password_hash": row[5],
-        "is_active": row[6],
-        "editable_instructions_snapshot": row[7],
-        "locked_safety_block_snapshot": row[8],
-        "effective_system_prompt_snapshot": row[9],
-        "created_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
-        "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
-        "chunk_count": row[12],
+        "instance_password_plain": row[6],
+        "is_active": row[7],
+        "editable_instructions_snapshot": row[8],
+        "locked_safety_block_snapshot": row[9],
+        "effective_system_prompt_snapshot": row[10],
+        "created_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+        "published_at": row[12].isoformat() if isinstance(row[12], datetime) else row[12],
+        "chunk_count": row[13],
     }
 
 
@@ -1047,6 +1198,7 @@ def get_bot_instance_by_code(conn: psycopg.Connection, instance_code: str) -> Op
                 i.name,
                 i.instance_code,
                 i.password_hash,
+                i.instance_password_plain,
                 i.is_active,
                 i.editable_instructions_snapshot,
                 i.locked_safety_block_snapshot,
@@ -1075,13 +1227,14 @@ def get_bot_instance_by_code(conn: psycopg.Connection, instance_code: str) -> Op
         "name": row[3],
         "instance_code": row[4],
         "password_hash": row[5],
-        "is_active": row[6],
-        "editable_instructions_snapshot": row[7],
-        "locked_safety_block_snapshot": row[8],
-        "effective_system_prompt_snapshot": row[9],
-        "created_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
-        "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
-        "chunk_count": row[12],
+        "instance_password_plain": row[6],
+        "is_active": row[7],
+        "editable_instructions_snapshot": row[8],
+        "locked_safety_block_snapshot": row[9],
+        "effective_system_prompt_snapshot": row[10],
+        "created_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+        "published_at": row[12].isoformat() if isinstance(row[12], datetime) else row[12],
+        "chunk_count": row[13],
     }
 
 
@@ -1096,6 +1249,7 @@ def get_bot_instance_by_id(conn: psycopg.Connection, instance_id: int) -> Option
                 i.name,
                 i.instance_code,
                 i.password_hash,
+                i.instance_password_plain,
                 i.is_active,
                 i.editable_instructions_snapshot,
                 i.locked_safety_block_snapshot,
@@ -1124,14 +1278,34 @@ def get_bot_instance_by_id(conn: psycopg.Connection, instance_id: int) -> Option
         "name": row[3],
         "instance_code": row[4],
         "password_hash": row[5],
-        "is_active": row[6],
-        "editable_instructions_snapshot": row[7],
-        "locked_safety_block_snapshot": row[8],
-        "effective_system_prompt_snapshot": row[9],
-        "created_at": row[10].isoformat() if isinstance(row[10], datetime) else row[10],
-        "published_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
-        "chunk_count": row[12],
+        "instance_password_plain": row[6],
+        "is_active": row[7],
+        "editable_instructions_snapshot": row[8],
+        "locked_safety_block_snapshot": row[9],
+        "effective_system_prompt_snapshot": row[10],
+        "created_at": row[11].isoformat() if isinstance(row[11], datetime) else row[11],
+        "published_at": row[12].isoformat() if isinstance(row[12], datetime) else row[12],
+        "chunk_count": row[13],
     }
+
+
+def delete_bot_instance(
+    conn: psycopg.Connection,
+    instance_id: int,
+    owner_username: str,
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM bot_instances
+            WHERE id = %s
+              AND owner_username = %s
+            RETURNING id;
+            """,
+            (instance_id, owner_username),
+        )
+        row = cur.fetchone()
+    return bool(row)
 
 
 def list_bot_instance_documents(conn: psycopg.Connection, instance_id: int) -> list[dict[str, Any]]:

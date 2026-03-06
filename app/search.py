@@ -16,6 +16,8 @@ def search_chunks(
     diversify_by_document: bool = False,
     max_per_document: int = 2,
     candidate_multiplier: int = 8,
+    include_reference_chunks: bool = False,
+    filename_tokens: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
@@ -24,26 +26,48 @@ def search_chunks(
 
     candidate_limit = max(top_k, top_k * max(1, candidate_multiplier))
 
+    filename_tokens = [t.strip().lower() for t in (filename_tokens or []) if t and t.strip()]
+    filename_filter_sql = ""
+    filename_filter_params: List[object] = []
+    if filename_tokens:
+        clauses = []
+        for token in filename_tokens:
+            clauses.append("LOWER(d.filename) LIKE %s")
+            filename_filter_params.append(f"%{token}%")
+        filename_filter_sql = " AND (" + " OR ".join(clauses) + ")"
+
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     d.filename,
                     d.path,
                     c.page_start,
                     c.page_end,
                     c.chunk_index,
+                    c.chunk_role,
                     c.content,
                     (c.embedding <=> %s) AS distance
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
                 WHERE c.embedding IS NOT NULL
+                  AND c.chunk_role = %s
                   AND d.course_id = %s
+                  {filename_filter_sql}
                 ORDER BY c.embedding <=> %s
                 LIMIT %s;
                 """,
-                (embedding, course_id, embedding, candidate_limit),
+                tuple(
+                    [
+                    embedding,
+                    "reference" if include_reference_chunks else "content",
+                    course_id,
+                    *filename_filter_params,
+                    embedding,
+                    candidate_limit,
+                    ]
+                ),
             )
             rows = cur.fetchall()
 
@@ -56,8 +80,9 @@ def search_chunks(
                 "page_start": row[2],
                 "page_end": row[3],
                 "chunk_index": row[4],
-                "content": row[5],
-                "distance": float(row[6]) if row[6] is not None else None,
+                "chunk_role": row[5],
+                "content": row[6],
+                "distance": float(row[7]) if row[7] is not None else None,
             }
         )
 
@@ -94,29 +119,53 @@ def search_instance_chunks(
     settings: Settings,
     top_k: int,
     instance_id: int,
+    include_reference_chunks: bool = False,
+    filename_tokens: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     if not query.strip():
         return []
 
     embedding = Vector(embed_text(query, settings))
 
+    filename_tokens = [t.strip().lower() for t in (filename_tokens or []) if t and t.strip()]
+    filename_filter_sql = ""
+    filename_filter_params: List[object] = []
+    if filename_tokens:
+        clauses = []
+        for token in filename_tokens:
+            clauses.append("LOWER(filename) LIKE %s")
+            filename_filter_params.append(f"%{token}%")
+        filename_filter_sql = " AND (" + " OR ".join(clauses) + ")"
+
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     filename,
                     page_start,
                     chunk_index,
+                    chunk_role,
                     content,
                     (embedding <=> %s) AS distance
                 FROM bot_instance_chunks
                 WHERE embedding IS NOT NULL
+                  AND chunk_role = %s
                   AND instance_id = %s
+                  {filename_filter_sql}
                 ORDER BY embedding <=> %s
                 LIMIT %s;
                 """,
-                (embedding, instance_id, embedding, top_k),
+                tuple(
+                    [
+                    embedding,
+                    "reference" if include_reference_chunks else "content",
+                    instance_id,
+                    *filename_filter_params,
+                    embedding,
+                    top_k,
+                    ]
+                ),
             )
             rows = cur.fetchall()
 
@@ -125,8 +174,9 @@ def search_instance_chunks(
             "filename": row[0],
             "page_start": row[1],
             "chunk_index": row[2],
-            "content": row[3],
-            "distance": float(row[4]) if row[4] is not None else None,
+            "chunk_role": row[3],
+            "content": row[4],
+            "distance": float(row[5]) if row[5] is not None else None,
         }
         for row in rows
     ]
