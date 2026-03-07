@@ -5,30 +5,30 @@ set -euo pipefail
 # Run on SERVER.
 #
 # Optional env:
-#   APP_DIR                default: /home/frede/RUCAI
-#   UCLOUD_SSH             default: ucloud@ssh.cloud.sdu.dk
-#   UCLOUD_SSH_PORT        default: 2485
-#   UCLOUD_APP_DIR         default: /work/FrederikMøllerHenriksen#7467/projects/RUCAI
+#   APP_DIR                default: /srv/rucai
+#   UCLOUD_SSH             default: ucloud@example-host
+#   UCLOUD_SSH_PORT        default: 22
+#   UCLOUD_APP_DIR         default: /work/project/RUCAI
 #   RUN_SYNC               default: 1 (server -> ucloud)
 #   RUN_RESUME             default: 1
 #   RUN_SWITCH             default: 1
 #   RUN_DOMAIN_CHECK       default: 1
-#   DOMAIN_HEALTH_URL      default: https://www.rucai.dk/health
+#   DOMAIN_HEALTH_URL      default: https://rucai.example.com/health
 #
 # Notes:
 # - Supports changed UCloud SSH port by setting UCLOUD_SSH_PORT.
 # - Requires key/auth from UCloud to server for reverse tunnel startup.
 
-APP_DIR="${APP_DIR:-/home/frede/RUCAI}"
-UCLOUD_SSH="${UCLOUD_SSH:-ucloud@ssh.cloud.sdu.dk}"
-UCLOUD_SSH_PORT="${UCLOUD_SSH_PORT:-2485}"
-UCLOUD_APP_DIR="${UCLOUD_APP_DIR:-/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
+APP_DIR="${APP_DIR:-/srv/rucai}"
+UCLOUD_SSH="${UCLOUD_SSH:-ucloud@example-host}"
+UCLOUD_SSH_PORT="${UCLOUD_SSH_PORT:-22}"
+UCLOUD_APP_DIR="${UCLOUD_APP_DIR:-/work/project/RUCAI}"
 
 RUN_SYNC="${RUN_SYNC:-1}"
 RUN_RESUME="${RUN_RESUME:-1}"
 RUN_SWITCH="${RUN_SWITCH:-1}"
 RUN_DOMAIN_CHECK="${RUN_DOMAIN_CHECK:-1}"
-DOMAIN_HEALTH_URL="${DOMAIN_HEALTH_URL:-https://www.rucai.dk/health}"
+DOMAIN_HEALTH_URL="${DOMAIN_HEALTH_URL:-https://rucai.example.com/health}"
 MAINTENANCE_WINDOW="${MAINTENANCE_WINDOW:-0}"
 
 cd "$APP_DIR"
@@ -62,10 +62,10 @@ if [[ "$RUN_SYNC" == "1" ]]; then
   ssh -p "$UCLOUD_SSH_PORT" "$UCLOUD_SSH" "
     set -e
     cd '$UCLOUD_APP_DIR'
-    export SERVER_SSH='${SERVER_SSH:-frede@212.27.13.34}'
+    export SERVER_SSH='${SERVER_SSH:-deploy@front.example.com}'
     export SERVER_SSH_PORT='${SERVER_SSH_PORT:-2111}'
-    export SERVER_APP_DIR='${SERVER_APP_DIR:-/home/frede/RUCAI}'
-    export SERVER_UPLOAD_ROOT='${SERVER_UPLOAD_ROOT:-/home/frede/RUCAI/data/uploads}'
+    export SERVER_APP_DIR='${SERVER_APP_DIR:-/srv/rucai}'
+    export SERVER_UPLOAD_ROOT='${SERVER_UPLOAD_ROOT:-/srv/rucai/data/uploads}'
     export SERVER_DB_HOST='${SERVER_DB_HOST}'
     export SERVER_DB_PORT='${SERVER_DB_PORT}'
     export SERVER_DB_NAME='${SERVER_DB_NAME}'

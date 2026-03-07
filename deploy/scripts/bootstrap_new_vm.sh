@@ -7,7 +7,7 @@ set -euo pipefail
 # Usage:
 #   APP_DIR="/work/.../RUCAI" bash deploy/scripts/bootstrap_new_vm.sh
 
-APP_DIR="${APP_DIR:-/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
+APP_DIR="${APP_DIR:-/work/project/RUCAI}"
 INSTALL_POSTGRES="${INSTALL_POSTGRES:-1}"
 INSTALL_OLLAMA="${INSTALL_OLLAMA:-0}"
 

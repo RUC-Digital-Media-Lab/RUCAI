@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage:
 #   APP_DIR=/work/.../RUCAI DB_PASSWORD='...' bash deploy/scripts/setup_local_postgres.sh
 
-APP_DIR="${APP_DIR:-/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
+APP_DIR="${APP_DIR:-/work/project/RUCAI}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-5432}"
 DB_NAME="${DB_NAME:-ppl_rag}"

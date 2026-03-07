@@ -5,22 +5,22 @@ set -euo pipefail
 # Run on SERVER.
 #
 # Optional env:
-#   APP_DIR                default: /home/frede/RUCAI
+#   APP_DIR                default: /srv/rucai
 #   RUN_SYNC               default: 1 (UCloud -> server)
 #   RUN_DEPLOY             default: 1
 #   RUN_SWITCH             default: 1
 #   RUN_DOMAIN_CHECK       default: 1
-#   DOMAIN_HEALTH_URL      default: https://www.rucai.dk/health
+#   DOMAIN_HEALTH_URL      default: https://rucai.example.com/health
 #
 # Sync env forwarded to sync_ucloud_to_server.sh:
 #   UCLOUD_SSH, UCLOUD_SSH_PORT, UCLOUD_APP_DIR, UCLOUD_UPLOAD_ROOT, ...
 
-APP_DIR="${APP_DIR:-/home/frede/RUCAI}"
+APP_DIR="${APP_DIR:-/srv/rucai}"
 RUN_SYNC="${RUN_SYNC:-1}"
 RUN_DEPLOY="${RUN_DEPLOY:-1}"
 RUN_SWITCH="${RUN_SWITCH:-1}"
 RUN_DOMAIN_CHECK="${RUN_DOMAIN_CHECK:-1}"
-DOMAIN_HEALTH_URL="${DOMAIN_HEALTH_URL:-https://www.rucai.dk/health}"
+DOMAIN_HEALTH_URL="${DOMAIN_HEALTH_URL:-https://rucai.example.com/health}"
 MAINTENANCE_WINDOW="${MAINTENANCE_WINDOW:-0}"
 
 cd "$APP_DIR"
@@ -49,10 +49,10 @@ fi
 
 if [[ "$RUN_SYNC" == "1" ]]; then
   echo "[1/4] Sync UCloud -> server"
-  : "${UCLOUD_SSH:=ucloud@ssh.cloud.sdu.dk}"
-  : "${UCLOUD_SSH_PORT:=2485}"
-  : "${UCLOUD_APP_DIR:=/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
-  : "${UCLOUD_UPLOAD_ROOT:=/work/FrederikMøllerHenriksen#7467/projects/RUCAI/data/uploads}"
+  : "${UCLOUD_SSH:=ucloud@example-host}"
+  : "${UCLOUD_SSH_PORT:=22}"
+  : "${UCLOUD_APP_DIR:=/work/project/RUCAI}"
+  : "${UCLOUD_UPLOAD_ROOT:=/work/project/RUCAI/data/uploads}"
   export UCLOUD_SSH UCLOUD_SSH_PORT UCLOUD_APP_DIR UCLOUD_UPLOAD_ROOT
   export SERVER_APP_DIR="${SERVER_APP_DIR:-$APP_DIR}"
   export SERVER_UPLOAD_ROOT="${SERVER_UPLOAD_ROOT:-$APP_DIR/data/uploads}"

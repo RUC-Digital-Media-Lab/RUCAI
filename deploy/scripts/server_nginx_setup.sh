@@ -5,10 +5,10 @@ set -euo pipefail
 # Run this script on the FRONT SERVER (not on UCloud).
 #
 # Example:
-#   DOMAIN=rucai-ruc.dk UPSTREAM_PORT=18011 TLS_EMAIL=you@example.com \
+#   DOMAIN=rucai.example.com UPSTREAM_PORT=18011 TLS_EMAIL=you@example.com \
 #   bash deploy/scripts/server_nginx_setup.sh
 
-DOMAIN="${DOMAIN:-rucai-ruc.dk}"
+DOMAIN="${DOMAIN:-rucai.example.com}"
 UPSTREAM_HOST="${UPSTREAM_HOST:-127.0.0.1}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-18011}"
 SITE_NAME="${SITE_NAME:-rucai}"

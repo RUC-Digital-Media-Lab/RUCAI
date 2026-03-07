@@ -5,9 +5,9 @@ set -euo pipefail
 # Run this script on SERVER.
 #
 # Required env:
-#   UCLOUD_SSH            e.g. ucloud@ssh.cloud.sdu.dk
-#   UCLOUD_SSH_PORT       e.g. 2485
-#   UCLOUD_APP_DIR        e.g. /work/FrederikMøllerHenriksen#7467/projects/RUCAI
+#   UCLOUD_SSH            e.g. ucloud@example-host
+#   UCLOUD_SSH_PORT       e.g. 22
+#   UCLOUD_APP_DIR        e.g. /work/project/RUCAI
 #   UCLOUD_UPLOAD_ROOT    e.g. /work/.../RUCAI/data/uploads
 #
 # Optional source DB env:
@@ -18,8 +18,8 @@ set -euo pipefail
 #   UCLOUD_DB_PASSWORD    optional; prefer .pgpass on source
 #
 # Optional destination env (server local):
-#   SERVER_APP_DIR        default: /home/frede/RUCAI
-#   SERVER_UPLOAD_ROOT    default: /home/frede/RUCAI/data/uploads
+#   SERVER_APP_DIR        default: /srv/rucai
+#   SERVER_UPLOAD_ROOT    default: /srv/rucai/data/uploads
 #   SERVER_DB_HOST        default: localhost
 #   SERVER_DB_PORT        default: 5432
 #   SERVER_DB_NAME        default: ppl_rag
@@ -33,8 +33,8 @@ set -euo pipefail
 #   USE_SOURCE_SUDO_DUMP_FALLBACK default: 1
 #   USE_DEST_SUDO_RESTORE_FALLBACK default: 1
 
-: "${UCLOUD_SSH:?Set UCLOUD_SSH, e.g. ucloud@ssh.cloud.sdu.dk}"
-: "${UCLOUD_SSH_PORT:?Set UCLOUD_SSH_PORT, e.g. 2485}"
+: "${UCLOUD_SSH:?Set UCLOUD_SSH, e.g. ucloud@example-host}"
+: "${UCLOUD_SSH_PORT:?Set UCLOUD_SSH_PORT, e.g. 22}"
 : "${UCLOUD_APP_DIR:?Set UCLOUD_APP_DIR}"
 : "${UCLOUD_UPLOAD_ROOT:?Set UCLOUD_UPLOAD_ROOT}"
 
@@ -43,8 +43,8 @@ UCLOUD_DB_PORT="${UCLOUD_DB_PORT:-5432}"
 UCLOUD_DB_NAME="${UCLOUD_DB_NAME:-ppl_rag}"
 UCLOUD_DB_USER="${UCLOUD_DB_USER:-ppl}"
 
-SERVER_APP_DIR="${SERVER_APP_DIR:-/home/frede/RUCAI}"
-SERVER_UPLOAD_ROOT="${SERVER_UPLOAD_ROOT:-/home/frede/RUCAI/data/uploads}"
+SERVER_APP_DIR="${SERVER_APP_DIR:-/srv/rucai}"
+SERVER_UPLOAD_ROOT="${SERVER_UPLOAD_ROOT:-/srv/rucai/data/uploads}"
 SERVER_DB_HOST="${SERVER_DB_HOST:-localhost}"
 SERVER_DB_PORT="${SERVER_DB_PORT:-5432}"
 SERVER_DB_NAME="${SERVER_DB_NAME:-ppl_rag}"

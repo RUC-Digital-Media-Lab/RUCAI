@@ -5,11 +5,11 @@ set -euo pipefail
 # Run this script on Green.
 #
 # Required env vars:
-#   BLUE_SSH          e.g. frede@212.27.13.34
+#   BLUE_SSH          e.g. deploy@blue.example.com
 #   BLUE_SSH_PORT     e.g. 2111
 #   BLUE_DB_NAME      e.g. ppl_rag
 #   BLUE_DB_USER      e.g. ppl
-#   BLUE_UPLOAD_ROOT  e.g. /home/frede/RUCAI/data/uploads
+#   BLUE_UPLOAD_ROOT  e.g. /srv/rucai/data/uploads
 #
 # Optional env vars:
 #   BLUE_DB_HOST      default: localhost
@@ -20,7 +20,7 @@ set -euo pipefail
 #   GREEN_DB_PORT     default: 5432
 #   GREEN_UPLOAD_ROOT default: /home/ucloud/RUCAI/data/uploads
 
-: "${BLUE_SSH:?Set BLUE_SSH, e.g. frede@212.27.13.34}"
+: "${BLUE_SSH:?Set BLUE_SSH, e.g. deploy@blue.example.com}"
 : "${BLUE_SSH_PORT:?Set BLUE_SSH_PORT, e.g. 2111}"
 : "${BLUE_DB_NAME:?Set BLUE_DB_NAME}"
 : "${BLUE_DB_USER:?Set BLUE_DB_USER}"

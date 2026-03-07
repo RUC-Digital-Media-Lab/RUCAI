@@ -7,7 +7,7 @@ set -euo pipefail
 # Usage:
 #   APP_DIR="/work/.../RUCAI" bash deploy/scripts/resume_rucai.sh
 
-APP_DIR="${APP_DIR:-/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
+APP_DIR="${APP_DIR:-/work/project/RUCAI}"
 BRANCH="${BRANCH:-main}"
 SKIP_GIT="${SKIP_GIT:-1}"
 
@@ -48,4 +48,3 @@ esac
 if [[ -n "${PUBLIC_BASE_URL:-}" ]]; then
   echo "PUBLIC_BASE_URL=${PUBLIC_BASE_URL}"
 fi
-

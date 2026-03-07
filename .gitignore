@@ -1,6 +1,10 @@
 # Local/private project files
 AGENTS.md
 rucai_participants.xlsx
+bruger_guide.docx
+data/
+deploy/README.md
+reference_papers/
 
 # Common local noise
 .DS_Store

@@ -5,10 +5,10 @@ set -euo pipefail
 # Run this script on UCLOUD.
 #
 # Required env:
-#   SERVER_SSH            e.g. frede@212.27.13.34
+#   SERVER_SSH            e.g. deploy@front.example.com
 #   SERVER_SSH_PORT       e.g. 2111
-#   SERVER_APP_DIR        e.g. /home/frede/RUCAI
-#   SERVER_UPLOAD_ROOT    e.g. /home/frede/RUCAI/data/uploads
+#   SERVER_APP_DIR        e.g. /srv/rucai
+#   SERVER_UPLOAD_ROOT    e.g. /srv/rucai/data/uploads
 #
 # Optional source DB env:
 #   SERVER_DB_HOST        default: localhost
@@ -18,8 +18,8 @@ set -euo pipefail
 #   SERVER_DB_PASSWORD    optional; prefer .pgpass on source
 #
 # Optional destination env (ucloud local):
-#   UCLOUD_APP_DIR        default: /work/FrederikMøllerHenriksen#7467/projects/RUCAI
-#   UCLOUD_UPLOAD_ROOT    default: /work/FrederikMøllerHenriksen#7467/projects/RUCAI/data/uploads
+#   UCLOUD_APP_DIR        default: /work/project/RUCAI
+#   UCLOUD_UPLOAD_ROOT    default: /work/project/RUCAI/data/uploads
 #   UCLOUD_DB_HOST        default: localhost
 #   UCLOUD_DB_PORT        default: 5432
 #   UCLOUD_DB_NAME        default: ppl_rag
@@ -32,7 +32,7 @@ set -euo pipefail
 #   SYNC_DB               default: 1
 #   USE_DEST_SUDO_RESTORE_FALLBACK default: 1
 
-: "${SERVER_SSH:?Set SERVER_SSH, e.g. frede@212.27.13.34}"
+: "${SERVER_SSH:?Set SERVER_SSH, e.g. deploy@front.example.com}"
 : "${SERVER_SSH_PORT:?Set SERVER_SSH_PORT, e.g. 2111}"
 : "${SERVER_APP_DIR:?Set SERVER_APP_DIR}"
 : "${SERVER_UPLOAD_ROOT:?Set SERVER_UPLOAD_ROOT}"
@@ -42,8 +42,8 @@ SERVER_DB_PORT="${SERVER_DB_PORT:-5432}"
 SERVER_DB_NAME="${SERVER_DB_NAME:-ppl_rag}"
 SERVER_DB_USER="${SERVER_DB_USER:-ppl}"
 
-UCLOUD_APP_DIR="${UCLOUD_APP_DIR:-/work/FrederikMøllerHenriksen#7467/projects/RUCAI}"
-UCLOUD_UPLOAD_ROOT="${UCLOUD_UPLOAD_ROOT:-/work/FrederikMøllerHenriksen#7467/projects/RUCAI/data/uploads}"
+UCLOUD_APP_DIR="${UCLOUD_APP_DIR:-/work/project/RUCAI}"
+UCLOUD_UPLOAD_ROOT="${UCLOUD_UPLOAD_ROOT:-/work/project/RUCAI/data/uploads}"
 UCLOUD_DB_HOST="${UCLOUD_DB_HOST:-localhost}"
 UCLOUD_DB_PORT="${UCLOUD_DB_PORT:-5432}"
 UCLOUD_DB_NAME="${UCLOUD_DB_NAME:-ppl_rag}"
