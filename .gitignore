@@ -5,6 +5,7 @@ bruger_guide.docx
 data/
 deploy/README.md
 reference_papers/
+ucloud_guide.md
 
 # Common local noise
 .DS_Store
