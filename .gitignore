@@ -6,6 +6,9 @@ data/
 deploy/README.md
 reference_papers/
 ucloud_guide.md
+docs/
+deploy/gpu_migration_plan.md
+deploy/checklists/gpu_pilot_cutover.md
 
 # Common local noise
 .DS_Store
