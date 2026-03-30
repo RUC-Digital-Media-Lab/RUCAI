@@ -13,3 +13,10 @@ Required sections:
 7. Verification
 
 Keep entries short and factual. Link PR/commit/script changes where relevant.
+
+## Emergency Stop for systemd Death Loops
+- Stop restart storm: `sudo systemctl stop rucai-api`
+- Clear failed state/counter: `sudo systemctl reset-failed rucai-api`
+- Inspect rendered unit: `sudo systemctl cat rucai-api`
+- Inspect recent logs: `sudo journalctl -u rucai-api -n 100 --no-pager`
+- Verify configured runtime user, group, app dir, `.env`, and `.venv/bin/uvicorn` before restarting.

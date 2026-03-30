@@ -4,17 +4,87 @@ set -euo pipefail
 # Deploy RUCAI on Green VM.
 # Run on Green VM as a user with sudo rights.
 
-APP_DIR="${APP_DIR:-/home/ucloud/RUCAI}"
+APP_DIR="${APP_DIR:-/home/frede/RUCAI}"
 BRANCH="${BRANCH:-release/gpu-pilot}"
 PORT="${PORT:-8011}"
 APP_PORT="${APP_PORT:-$PORT}"
 SERVICE_NAME="${SERVICE_NAME:-rucai-api}"
+SERVICE_USER="${SERVICE_USER:-frede}"
+SERVICE_GROUP="${SERVICE_GROUP:-frede}"
 SKIP_GIT="${SKIP_GIT:-0}"
 RUNNER_MODE="${RUNNER_MODE:-auto}"
 TMUX_SESSION="${TMUX_SESSION:-rucai-api}"
 ACCESS_MODE="${ACCESS_MODE:-none}"
 ENABLE_CLOUDFLARE_TUNNEL="${ENABLE_CLOUDFLARE_TUNNEL:-0}"
 ENABLE_OPS_MONITOR="${ENABLE_OPS_MONITOR:-1}"
+
+render_systemd_unit() {
+  local destination="$1"
+  APP_DIR="$APP_DIR" \
+  SERVICE_USER="$SERVICE_USER" \
+  SERVICE_GROUP="$SERVICE_GROUP" \
+  APP_PORT="$APP_PORT" \
+  python3 - "$destination" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+destination = Path(sys.argv[1])
+template = Path("deploy/systemd/rucai-api.service").read_text()
+app_dir = Path(os.environ["APP_DIR"])
+replacements = {
+    "__SERVICE_USER__": os.environ["SERVICE_USER"],
+    "__SERVICE_GROUP__": os.environ["SERVICE_GROUP"],
+    "__APP_DIR__": str(app_dir),
+    "__ENV_FILE__": str(app_dir / ".env"),
+    "__UVICORN_BIN__": str(app_dir / ".venv" / "bin" / "uvicorn"),
+    "__APP_PORT__": os.environ["APP_PORT"],
+}
+for needle, value in replacements.items():
+    template = template.replace(needle, value)
+destination.write_text(template)
+PY
+}
+
+validate_systemd_runtime() {
+  local uvicorn_bin="$APP_DIR/.venv/bin/uvicorn"
+  local env_file="$APP_DIR/.env"
+
+  if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+    echo "Configured SERVICE_USER '$SERVICE_USER' does not exist."
+    echo "Stop the loop with: sudo systemctl stop ${SERVICE_NAME}; sudo systemctl reset-failed ${SERVICE_NAME}"
+    exit 1
+  fi
+  if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+    echo "Configured SERVICE_GROUP '$SERVICE_GROUP' does not exist."
+    echo "Stop the loop with: sudo systemctl stop ${SERVICE_NAME}; sudo systemctl reset-failed ${SERVICE_NAME}"
+    exit 1
+  fi
+  if [[ ! -d "$APP_DIR" ]]; then
+    echo "Configured APP_DIR '$APP_DIR' does not exist."
+    exit 1
+  fi
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing environment file: $env_file"
+    exit 1
+  fi
+  if [[ ! -x "$uvicorn_bin" ]]; then
+    echo "Missing executable uvicorn binary: $uvicorn_bin"
+    exit 1
+  fi
+}
+
+print_runtime_assumptions() {
+  echo "Runtime assumptions:"
+  echo "  runner_mode: ${RUNNER_MODE}"
+  echo "  service_name: ${SERVICE_NAME}"
+  echo "  service_user: ${SERVICE_USER}"
+  echo "  service_group: ${SERVICE_GROUP}"
+  echo "  app_dir: ${APP_DIR}"
+  echo "  env_file: ${APP_DIR}/.env"
+  echo "  exec_start: ${APP_DIR}/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port ${APP_PORT}"
+  echo "  app_port: ${APP_PORT}"
+}
 
 if [[ "$SKIP_GIT" != "1" && ! -d "$APP_DIR/.git" ]]; then
   echo "Missing git repo at $APP_DIR"
@@ -51,6 +121,13 @@ set -a
 source .env
 set +a
 
+# Normalize port selection so systemd, tmux, health checks, and tunnels all use the same value.
+if [[ -n "${APP_PORT:-}" ]]; then
+  PORT="$APP_PORT"
+else
+  APP_PORT="$PORT"
+fi
+
 # Keep explicit env value as override if provided at runtime.
 ACCESS_MODE="${ACCESS_MODE:-none}"
 
@@ -65,8 +142,10 @@ fi
 
 if [[ "$SYSTEMD_OK" == "1" ]]; then
   echo "[4/7] Install/refresh systemd unit"
+  validate_systemd_runtime
   tmp_service="$(mktemp)"
-  sed "s|/home/ucloud/RUCAI|$APP_DIR|g" deploy/systemd/rucai-api.service > "$tmp_service"
+  render_systemd_unit "$tmp_service"
+  print_runtime_assumptions
   sudo cp "$tmp_service" /etc/systemd/system/${SERVICE_NAME}.service
   rm -f "$tmp_service"
   sudo systemctl daemon-reload
@@ -83,6 +162,7 @@ else
     echo "tmux is required in non-systemd mode. Please install tmux and rerun."
     exit 1
   fi
+  print_runtime_assumptions
   mkdir -p "$APP_DIR/.logs"
   log_file="$APP_DIR/.logs/rucai.log"
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
