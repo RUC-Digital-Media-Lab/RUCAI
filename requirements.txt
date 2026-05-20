@@ -1,5 +1,6 @@
 docling
 pypdf
+python-docx
 psycopg[binary]
 pgvector
 fastapi
