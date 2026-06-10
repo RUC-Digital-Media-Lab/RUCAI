@@ -1,5 +1,7 @@
 # RUCAI
 
+[![DOI](https://zenodo.org/badge/1162919450.svg)](https://doi.org/10.5281/zenodo.20622874)
+
 RUCAI is a self-hosted course AI application for teachers who want a chat
 interface grounded in their own course materials. A teacher can create a course
 workspace, upload PDF and DOCX readings, ask questions against those materials,
